@@ -1,0 +1,9 @@
+name: Toast_WorldEditAsync
+version: 0.1.0
+main: com.toast.worldeditasync.WorldEditAsyncPlugin
+api-version: "1.21"
+depend: [WorldEdit]
+commands:
+  wepoc:
+    description: WorldEdit async engine feasibility PoC commands
+    usage: /wepoc <write|mspt|unhook> [args]
