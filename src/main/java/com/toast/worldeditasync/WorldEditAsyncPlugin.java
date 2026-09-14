@@ -2,6 +2,7 @@ package com.toast.worldeditasync;
 
 import com.sk89q.worldedit.EditSession;
 import com.sk89q.worldedit.WorldEdit;
+import com.sk89q.worldedit.WorldEditException;
 import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.event.extent.EditSessionEvent;
 import com.sk89q.worldedit.util.eventbus.Subscribe;
@@ -111,6 +112,25 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     private static final long DANGER_CONFIRM_TTL_MILLIS = 30_000L;
     private final Map<UUID, Long> pendingDangerConfirmByActor = new ConcurrentHashMap<>();
     private UndoManager undoManager;
+
+    /**
+     * 2026-09-15：第三方外掛（例如 BetterStructures 生成大型建築時）呼叫
+     * {@code WorldEdit.getInstance().newEditSession(World)} 完全不帶 actor——反解確認過，
+     * 這類呼叫觸發的 {@link EditSessionEvent#getActor()} 永遠是 {@code null}。原本這裡直接
+     * {@code return}、整段編輯完全放給 WorldEdit 原生同步路徑處理，等於這類操作不管
+     * {@code engine} 開關為何都攔不到——壓力測試已經證實這條原生路徑在大型操作下會讓主執行緒
+     * 卡住超過看門狗時限（見驗證報告「二點十八」）。與其一個個去 patch 各個第三方外掛讓它們
+     * 補上 actor（脆弱、且以後每次外掛更新都要重新確認），改成在這裡用一個固定的系統假
+     * {@code UUID} 頂替，讓「沒有真人 actor 的編輯」也能走同一套 {@link WEAsyncExtent}/
+     * {@link UndoManager} 分批限流管線。下游（{@link WEAsyncExtent}、{@link UndoManager}）
+     * 全程只用 {@code UUID} 當 key，從未直接碰 WorldEdit 的 {@code Actor} 物件本身，且
+     * {@code notifyPlayer}/{@code maybeSendProgressActionBar} 對「找不到對應線上玩家」
+     * 已經是 null-safe（{@code Bukkit.getPlayer(actor) == null} 就靜默跳過，只留 log），
+     * 所以這個系統假 actor 不需要下游額外配合就能安全共用整條管線——它甚至會累積自己的
+     * undo 堆疊，理論上管理員之後可以用一個綁定同一個系統 UUID 的指令 undo 掉一次
+     * 系統觸發的大型結構貼上（目前尚未實作對應指令，先留著這個可能性）。
+     */
+    static final UUID SYSTEM_ACTOR_UUID = new UUID(0L, 0L);
 
     @Override
     public void onEnable() {
@@ -393,15 +413,15 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         if (event.getStage() != EditSession.Stage.BEFORE_HISTORY) {
             return;
         }
-        if (event.getActor() == null) {
-            return;
-        }
         try {
             org.bukkit.World bukkitWorld = BukkitAdapter.adapt(event.getWorld());
             ServerLevel level = ((CraftWorld) bukkitWorld).getHandle();
             WEAsyncExtent wrapped = new WEAsyncExtent(event.getExtent(), level, this);
             event.setExtent(wrapped);
-            UUID actorId = event.getActor().getUniqueId();
+            // 見 SYSTEM_ACTOR_UUID 欄位註解：沒有真人 actor（第三方外掛的無 actor 呼叫）
+            // 時頂替一個固定系統假 UUID，讓這類編輯一樣被接管、走分批限流，而不是放給
+            // WorldEdit 原生同步路徑直接卡住主執行緒。
+            UUID actorId = event.getActor() != null ? event.getActor().getUniqueId() : SYSTEM_ACTOR_UUID;
             lastExtentByActor.put(actorId, wrapped);
             String worldKey = level.dimension().location().toString();
             // 用一次就丟：這個 tier 只給「引發這次 EditSessionEvent 的那個指令」用，
@@ -424,7 +444,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger> [args]");
+            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -458,8 +478,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                 return handlePropDump(sender, args);
             case "danger":
                 return handleDangerConfirm(sender, args);
+            case "noactortest":
+                return handleNoActorTest(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger> [args]");
+                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest> [args]");
                 return true;
         }
     }
@@ -597,6 +619,54 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         }
         sender.sendMessage("[WEPoC] " + args[1] + " getPropertyMap keys=" + type.getPropertyMap().keySet());
         sender.sendMessage("[WEPoC] defaultState=" + type.getDefaultState());
+        return true;
+    }
+
+    /**
+     * 驗證 SYSTEM_ACTOR_UUID 那段修法：故意建立一個**完全不帶 actor** 的 EditSession
+     * （跟 BetterStructures 的 {@code ModulePasting.java} 呼叫 {@code newEditSession(World)}
+     * 是同一種呼叫方式），寫入一小塊區域，再檢查系統假 UUID 的 undo 深度有沒有增加——
+     * 增加就代表這次編輯真的被我們的 {@link WEAsyncExtent}/{@link UndoManager} 接管，
+     * 沒有走 WorldEdit 原生同步路徑（原生路徑完全不會碰 undoManager，深度永遠不動）。
+     * /wepoc noactortest x1 y1 z1 x2 y2 z2
+     */
+    private boolean handleNoActorTest(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player) || args.length < 7) {
+            sender.sendMessage("用法: /wepoc noactortest x1 y1 z1 x2 y2 z2"
+                    + "（模擬第三方外掛不帶 actor 呼叫 WorldEdit，驗證這類編輯會不會被引擎接管）");
+            return true;
+        }
+        try {
+            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
+            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
+            int depthBefore = undoManager.getUndoDepth(SYSTEM_ACTOR_UUID);
+            com.sk89q.worldedit.world.World adaptedWorld = BukkitAdapter.adapt(player.getWorld());
+            try (EditSession editSession = WorldEdit.getInstance().newEditSessionBuilder()
+                    .world(adaptedWorld)
+                    .build()) {
+                editSession.setBlocks(new com.sk89q.worldedit.regions.CuboidRegion(
+                                com.sk89q.worldedit.math.BlockVector3.at(x1, y1, z1),
+                                com.sk89q.worldedit.math.BlockVector3.at(x2, y2, z2)),
+                        com.sk89q.worldedit.world.block.BlockTypes.STONE.getDefaultState());
+            }
+            // engine=off 時上面這段就是純原生同步路徑（跟沒裝這個引擎時 BetterStructures
+            // 貼結構的行為完全一樣），系統假 UUID 從頭到尾不會被 UndoManager 碰到。
+            // enqueueForward 是排到下一個 tick 才真正處理、寫入本身還要再經過分批限流跨數個
+            // tick 完成，這裡不能立刻檢查深度，延遲 40 tick（2 秒，5x5x5 這種小範圍測試量綽綽
+            // 有餘）再回報結果。
+            sender.sendMessage("[WEPoC] noactortest 已送出（before 深度=" + depthBefore + "），2 秒後回報結果...");
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                int depthAfter = undoManager.getUndoDepth(SYSTEM_ACTOR_UUID);
+                sender.sendMessage("[WEPoC] noactortest 結果：系統假 actor undo 深度 " + depthBefore
+                        + " -> " + depthAfter + (depthAfter > depthBefore
+                                ? "（被引擎接管，走分批限流管線）"
+                                : "（engine=off 或攔截失敗，走 WorldEdit 原生同步路徑）"));
+            }, 40L);
+        } catch (NumberFormatException e) {
+            sender.sendMessage("座標必須是整數");
+        } catch (WorldEditException e) {
+            sender.sendMessage("[WEPoC] noactortest 失敗: " + e);
+        }
         return true;
     }
 
