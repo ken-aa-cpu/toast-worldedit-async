@@ -445,7 +445,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest> [args]");
+            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -485,8 +485,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                 return handleRustLightTest(sender, args);
             case "lightwritetest":
                 return handleLightWriteTest(sender, args);
+            case "relightverify":
+                return handleRelightVerify(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest> [args]");
+                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
                 return true;
         }
     }
@@ -814,6 +816,12 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             net.minecraft.world.level.chunk.DataLayer existing = blockListener.getDataLayerData(sectionPos);
             net.minecraft.world.level.chunk.DataLayer backup = existing != null ? existing.copy()
                     : new net.minecraft.world.level.chunk.DataLayer();
+            // 2026-09-15 讀 Paper Starlight 原始碼 + Yarn 反編譯的 vanilla 原始碼後查到：
+            // queueSectionData 的 pending->visible swap 有一個閘門——只有這個 section
+            // 已經被引擎認證為「有資料」的狀態，排隊寫入才會真的被套用，否則永遠卡在
+            // pending 裡不生效也不報錯。vanilla 用一個 debug 用的公開方法把這個狀態
+            // 曝露出來，先印出來確認我們測試的這個 section 到底是不是這個狀態。
+            Object sectionTypeBefore = lightEngine.getDebugSectionType(LightLayer.BLOCK, sectionPos);
 
             int localX = net.minecraft.core.SectionPos.sectionRelative(x);
             int localY = net.minecraft.core.SectionPos.sectionRelative(y);
@@ -829,14 +837,15 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             // 交給它自己的排程機制非同步處理，延遲幾個 tick 後才讀回檢查有沒有生效。
             lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, corrupted);
             sender.sendMessage(String.format(Locale.ROOT,
-                    "[WEPoC] lightwritetest: 原值=%d，已排隊改成=%d，1 秒後讀回確認+還原...",
-                    originalValue, corruptedValue));
+                    "[WEPoC] lightwritetest: 原值=%d，已排隊改成=%d，section狀態(排隊前)=%s，1 秒後讀回確認+還原...",
+                    originalValue, corruptedValue, sectionTypeBefore));
             Bukkit.getScheduler().runTaskLater(this, () -> {
                 int afterCorrupt = blockListener.getLightValue(pos);
                 boolean writeWorked = afterCorrupt == corruptedValue;
+                Object sectionTypeAfter = lightEngine.getDebugSectionType(LightLayer.BLOCK, sectionPos);
                 sender.sendMessage(String.format(Locale.ROOT,
-                        "[WEPoC] lightwritetest: 讀回=%d（寫入%s生效），現在排隊還原...",
-                        afterCorrupt, writeWorked ? "有" : "沒有"));
+                        "[WEPoC] lightwritetest: 讀回=%d（寫入%s生效），section狀態(排隊後)=%s，現在排隊還原...",
+                        afterCorrupt, writeWorked ? "有" : "沒有", sectionTypeAfter));
                 lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, backup);
                 Bukkit.getScheduler().runTaskLater(this, () -> {
                     int afterRestore = blockListener.getLightValue(pos);
@@ -850,6 +859,91 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                         sender.sendMessage("[WEPoC] !!! 還原失敗，這個位置的光值可能被改壞了，建議手動 /wepoc write 或重載該 chunk !!!");
                     }
                 }, 20L);
+            }, 20L);
+        } catch (NumberFormatException e) {
+            sender.sendMessage("座標必須是整數");
+        }
+        return true;
+    }
+
+    /**
+     * 驗證 {@link UndoManager} 正式 RELIGHT_APPLY（Rust 光罩計算池寫回）這條路徑本身算出來
+     * 的結果，跟 vanilla 拿同一批最終方塊狀態重新逐格 checkBlock 算出來的結果是否一致——
+     * 跟 {@code rustlighttest} 不一樣：那個是離線單獨呼叫 Rust，完全不碰 UndoManager；
+     * 這個是先讀一次「引擎剛剛寫回的值」，再強制 vanilla 用 checkBlock 重算同一個範圍
+     * （vanilla 用真實方塊狀態重算，結果應該收斂到跟引擎寫回的一樣），兩者一致才代表整條
+     * 正式路徑（含 hasSection 閘門判斷、DataLayer 組裝、queueSectionData 排隊）是對的。
+     * /wepoc relightverify x1 y1 z1 x2 y2 z2
+     */
+    private boolean handleRelightVerify(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player) || args.length < 7) {
+            sender.sendMessage("用法: /wepoc relightverify x1 y1 z1 x2 y2 z2"
+                    + "（讀一次目前光值，強制 vanilla checkBlock 重算同一範圍，比對兩者是否一致）");
+            return true;
+        }
+        try {
+            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
+            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
+            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
+            int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
+            int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
+            int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
+            var blockListener = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
+            var skyListener = level.getLightEngine().getLayerListener(LightLayer.SKY);
+
+            List<BlockPos> positions = new ArrayList<>();
+            int[] beforeBlock;
+            int[] beforeSky;
+            {
+                List<Integer> bb = new ArrayList<>();
+                List<Integer> bs = new ArrayList<>();
+                for (int x = minX; x <= maxX; x++) {
+                    for (int y = minY; y <= maxY; y++) {
+                        for (int z = minZ; z <= maxZ; z++) {
+                            BlockPos pos = new BlockPos(x, y, z);
+                            positions.add(pos);
+                            bb.add(blockListener.getLightValue(pos));
+                            bs.add(skyListener.getLightValue(pos));
+                        }
+                    }
+                }
+                beforeBlock = bb.stream().mapToInt(Integer::intValue).toArray();
+                beforeSky = bs.stream().mapToInt(Integer::intValue).toArray();
+            }
+
+            for (BlockPos pos : positions) {
+                level.getLightEngine().checkBlock(pos);
+            }
+            sender.sendMessage("[WEPoC] relightverify 已強制 vanilla 重算 " + positions.size() + " 格，1 秒後比對...");
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                int total = positions.size(), exactBlock = 0, closeBlock = 0, exactSky = 0, closeSky = 0;
+                int worstBlockDiff = 0, worstSkyDiff = 0;
+                List<String> examples = new ArrayList<>();
+                for (int i = 0; i < total; i++) {
+                    BlockPos pos = positions.get(i);
+                    int afterBlock = blockListener.getLightValue(pos);
+                    int afterSky = skyListener.getLightValue(pos);
+                    int diffBlock = Math.abs(afterBlock - beforeBlock[i]);
+                    int diffSky = Math.abs(afterSky - beforeSky[i]);
+                    worstBlockDiff = Math.max(worstBlockDiff, diffBlock);
+                    worstSkyDiff = Math.max(worstSkyDiff, diffSky);
+                    if (diffBlock == 0) exactBlock++;
+                    if (diffBlock <= 1) closeBlock++;
+                    if (diffSky == 0) exactSky++;
+                    if (diffSky <= 1) closeSky++;
+                    if (diffBlock > 1 && examples.size() < 5) {
+                        examples.add(String.format(Locale.ROOT, "pos=%s 引擎寫回=%d vanilla重算=%d",
+                                pos, beforeBlock[i], afterBlock));
+                    }
+                }
+                sender.sendMessage(String.format(Locale.ROOT,
+                        "[WEPoC] relightverify %d 格：方塊光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d"
+                                + " | 天空光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d",
+                        total, exactBlock, 100.0 * exactBlock / total, closeBlock, 100.0 * closeBlock / total, worstBlockDiff,
+                        exactSky, 100.0 * exactSky / total, closeSky, 100.0 * closeSky / total, worstSkyDiff));
+                for (String ex : examples) {
+                    sender.sendMessage("[WEPoC]   " + ex);
+                }
             }, 20L);
         } catch (NumberFormatException e) {
             sender.sendMessage("座標必須是整數");

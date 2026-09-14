@@ -1,13 +1,19 @@
 package com.toast.worldeditasync;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.lighting.LayerLightSectionStorage;
+import net.minecraft.world.level.lighting.LevelLightEngine;
+import com.toast.worldeditasync.light.RustLightEngine;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.v1_21_R1.CraftServer;
 import org.bukkit.entity.Player;
@@ -16,6 +22,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Locale;
@@ -49,8 +56,15 @@ public final class UndoManager {
      * 跟寫入同一份「每 tick 預算」逐步消耗，可以跨多個 tick 完成。兩階段共用同一份
      * bounding box 資料（只在寫入全部完成、世界已是最終狀態後才開始 relight，避免
      * 2026-09-13 光照完整性驗證抓到的「鄰居還沒填完就 relight 導致內部殘留舊光值」問題）。
+     *
+     * 2026-09-15 大範圍操作改接 Rust 光罩計算池：RELIGHT 拆成三個子階段
+     * GATHER（讀取整個 relight box 的方塊資料，budget 內完成，跟 WRITE 共用同一套跨 tick
+     * 分批機制）→ WAIT（丟到背景執行緒後純等待，逾時或失敗會 fallback）→ APPLY（把算好的
+     * 結果寫回，逐格 budget 限流）。box 太小（見 {@link #RUST_RELIGHT_MIN_VOLUME}）或計算池
+     * 不可用/逾時/失敗，一律 fallback 回舊版逐格 {@code checkBlock}（{@code Phase.RELIGHT}）
+     * ——這條路徑正確性已經過完整驗證，永遠是安全網。
      */
-    private enum Phase { WRITE, RELIGHT }
+    private enum Phase { WRITE, RELIGHT, RELIGHT_GATHER, RELIGHT_WAIT, RELIGHT_APPLY }
 
     private static final class QueuedAction {
         final ActionType type;
@@ -78,6 +92,23 @@ public final class UndoManager {
         int relightTotal = 0;
         int relightDone = 0;
         long lastActionBarMillis = 0L;
+        boolean relightFinished = false;
+
+        // Rust 光罩計算池的中繼狀態，只有 phase 進到 RELIGHT_GATHER 之後才會用到。
+        int rlMinX, rlMinY, rlMinZ, rlWidth, rlHeight, rlLength;
+        byte[] rlOpacity;
+        byte[] rlBlockSeed;
+        byte[] rlSkySeed;
+        int gatherIndex = 0;
+        int applyIndex = 0;
+        long rustDispatchMillis;
+        volatile boolean rustDone = false;
+        volatile boolean rustSucceeded = false;
+        volatile RustLightEngine.Result rustResult;
+        Map<Long, DataLayer> pendingBlockLayers;
+        Map<Long, DataLayer> pendingSkyLayers;
+        Map<Long, Boolean> blockSectionReady;
+        Map<Long, Boolean> skySectionReady;
 
         Job(ActionType type, EditRecord record, ServerLevel level, SpeedTier tier) {
             this.type = type;
@@ -86,6 +117,20 @@ public final class UndoManager {
             this.tier = tier;
         }
     }
+
+    /**
+     * box 體積低於這個門檻就直接走舊版逐格 {@code checkBlock}，不值得付出 Rust 派工／JNI
+     * 陣列搬運的固定成本——小範圍操作 checkBlock 本來就很快，計算池的優勢只在大範圍才會
+     * 體現。門檻本身沒有實測校準過，先用一個保守的量級（4 萬格，大約一個 34x34x34 的方塊）
+     * 卡住，之後有真實效能數據再調整。
+     */
+    private static final long RUST_RELIGHT_MIN_VOLUME = 40_000L;
+    /**
+     * 見 {@link RustLightEngine} 類別註解「呼叫端規則」：呼叫端要自己控制逾時，Rust 端算得
+     * 異常久也不能拖住整個操作。逾時就放棄這批，fallback 回逐格 checkBlock（該 box 這次直接
+     * 認賠用慢路徑，不重試——避免同一批操作反覆卡在逾時->重派工的迴圈）。
+     */
+    private static final long RUST_RELIGHT_TIMEOUT_MILLIS = 20_000L;
 
     private final JavaPlugin plugin;
     private final Map<UUID, Deque<EditRecord>> undoStacks = new ConcurrentHashMap<>();
@@ -229,10 +274,7 @@ public final class UndoManager {
                 }
             }
             if (!yielded) {
-                job.phase = Phase.RELIGHT;
-                RelightRange range = buildRelightRange(changes);
-                job.relightIterator = range.iterator();
-                job.relightTotal = range.total();
+                beginRelightPhase(job, changes);
             }
         }
 
@@ -245,6 +287,45 @@ public final class UndoManager {
                     break;
                 }
             }
+            if (!yielded) {
+                job.relightFinished = true;
+            }
+        }
+
+        if (!yielded && job.phase == Phase.RELIGHT_GATHER) {
+            yielded = !gatherRustLightGrid(job, start, budgetNanos);
+            if (!yielded) {
+                dispatchRustCompute(job);
+                job.phase = Phase.RELIGHT_WAIT;
+            }
+        }
+
+        if (!yielded && job.phase == Phase.RELIGHT_WAIT) {
+            if (job.rustDone) {
+                if (job.rustSucceeded) {
+                    beginRelightApply(job);
+                } else {
+                    plugin.getLogger().warning("[WEPoC] 光罩計算池這批失敗，fallback 回逐格 checkBlock");
+                    fallbackToCheckBlockRelight(job);
+                }
+            } else if (System.currentTimeMillis() - job.rustDispatchMillis > RUST_RELIGHT_TIMEOUT_MILLIS) {
+                plugin.getLogger().warning("[WEPoC] 光罩計算池逾時（>" + RUST_RELIGHT_TIMEOUT_MILLIS + "ms），fallback 回逐格 checkBlock");
+                fallbackToCheckBlockRelight(job);
+            } else {
+                yielded = true; // 純等待背景執行緒，這個 tick 不做事
+            }
+        }
+
+        if (!yielded && job.phase == Phase.RELIGHT_APPLY) {
+            yielded = !applyRustLightResult(job, start, budgetNanos);
+            if (!yielded) {
+                flushPendingLightLayers(job);
+                job.relightFinished = true;
+                job.rlOpacity = null;
+                job.rlBlockSeed = null;
+                job.rlSkySeed = null;
+                job.rustResult = null;
+            }
         }
 
         autoThrottle.recordOwnContribution(System.nanoTime() - start);
@@ -253,10 +334,214 @@ public final class UndoManager {
         if (yielded) {
             return; // 讓出這個 tick，job 還留在 currentJobs，下一 tick 從目前 phase/iterator 位置繼續
         }
-        if (job.phase == Phase.RELIGHT) {
+        if (job.relightFinished) {
             finishJob(actor, job);
             currentJobs.remove(actor);
         }
+    }
+
+    /**
+     * WRITE 完成後決定 RELIGHT 怎麼跑：box 太小或計算池不可用一律走舊版逐格 checkBlock
+     * （安全網，正確性已驗證過）；夠大且可用才進 RELIGHT_GATHER 準備丟給 Rust。
+     */
+    private void beginRelightPhase(Job job, ChangeBuffer touched) {
+        if (touched.isEmpty()) {
+            job.phase = Phase.RELIGHT;
+            job.relightIterator = Collections.emptyIterator();
+            job.relightTotal = 0;
+            return;
+        }
+        int[] box = computeRelightBox(touched);
+        long volume = (long) (box[3] - box[0] + 1) * (box[4] - box[1] + 1) * (box[5] - box[2] + 1);
+        boolean rustEligible = volume >= RUST_RELIGHT_MIN_VOLUME && volume <= Integer.MAX_VALUE
+                && RustLightEngine.isAvailable(plugin.getLogger());
+        if (!rustEligible) {
+            job.phase = Phase.RELIGHT;
+            job.relightIterator = new BoxIterator(box[0], box[1], box[2], box[3], box[4], box[5]);
+            job.relightTotal = (int) volume;
+            return;
+        }
+        job.rlMinX = box[0];
+        job.rlMinY = box[1];
+        job.rlMinZ = box[2];
+        job.rlWidth = box[3] - box[0] + 1;
+        job.rlHeight = box[4] - box[1] + 1;
+        job.rlLength = box[5] - box[2] + 1;
+        int total = job.rlWidth * job.rlHeight * job.rlLength;
+        job.rlOpacity = new byte[total];
+        job.rlBlockSeed = new byte[total];
+        job.rlSkySeed = new byte[total];
+        job.gatherIndex = 0;
+        job.relightTotal = total;
+        job.relightDone = 0;
+        job.phase = Phase.RELIGHT_GATHER;
+    }
+
+    /** 逐格讀取 relight box 內的擋光值＋種子值，跟舊版 checkBlock 迴圈共用同一套 budget 節流。 */
+    private boolean gatherRustLightGrid(Job job, long start, long budgetNanos) {
+        int width = job.rlWidth, height = job.rlHeight, length = job.rlLength;
+        int total = width * height * length;
+        var blockListener = job.level.getLightEngine().getLayerListener(LightLayer.BLOCK);
+        var skyListener = job.level.getLightEngine().getLayerListener(LightLayer.SKY);
+        while (job.gatherIndex < total) {
+            int idx = job.gatherIndex++;
+            int lz = idx % length;
+            int rem = idx / length;
+            int ly = rem % height;
+            int lx = rem / height;
+            BlockPos pos = new BlockPos(job.rlMinX + lx, job.rlMinY + ly, job.rlMinZ + lz);
+            BlockState state = job.level.getBlockState(pos);
+            job.rlOpacity[idx] = (byte) state.getLightBlock(job.level, pos);
+            boolean boundary = lx == 0 || ly == 0 || lz == 0
+                    || lx == width - 1 || ly == height - 1 || lz == length - 1;
+            if (boundary) {
+                job.rlBlockSeed[idx] = (byte) blockListener.getLightValue(pos);
+                job.rlSkySeed[idx] = (byte) skyListener.getLightValue(pos);
+            } else {
+                int emission = state.getLightEmission();
+                if (emission > 0) {
+                    job.rlBlockSeed[idx] = (byte) emission;
+                    job.rlSkySeed[idx] = -1;
+                } else {
+                    job.rlBlockSeed[idx] = -1;
+                    job.rlSkySeed[idx] = -1;
+                }
+            }
+            job.relightDone++;
+            if (job.relightDone % PROGRESS_CHECK_INTERVAL == 0 && System.nanoTime() - start > budgetNanos) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 見 {@link RustLightEngine} 類別註解「呼叫端規則」：永遠不在主執行緒直接呼叫，一律丟
+     * 背景執行緒，自己控制逾時。rustDone 最後才寫（volatile），保證 rustResult/rustSucceeded
+     * 在其他執行緒觀察到 rustDone==true 時已經完整可見。
+     */
+    private void dispatchRustCompute(Job job) {
+        job.rustDone = false;
+        job.rustSucceeded = false;
+        job.rustDispatchMillis = System.currentTimeMillis();
+        final int w = job.rlWidth, h = job.rlHeight, l = job.rlLength;
+        final byte[] opacity = job.rlOpacity, blockSeed = job.rlBlockSeed, skySeed = job.rlSkySeed;
+        final Job target = job;
+        new Thread(() -> {
+            var resultOpt = RustLightEngine.tryComputeLight(plugin.getLogger(), w, h, l, opacity, blockSeed, skySeed);
+            target.rustResult = resultOpt.orElse(null);
+            target.rustSucceeded = resultOpt.isPresent();
+            target.rustDone = true;
+        }, "wepoc-relight-rust").start();
+    }
+
+    private void fallbackToCheckBlockRelight(Job job) {
+        job.relightIterator = new BoxIterator(job.rlMinX, job.rlMinY, job.rlMinZ,
+                job.rlMinX + job.rlWidth - 1, job.rlMinY + job.rlHeight - 1, job.rlMinZ + job.rlLength - 1);
+        job.relightTotal = job.rlWidth * job.rlHeight * job.rlLength;
+        job.relightDone = 0;
+        job.rlOpacity = null;
+        job.rlBlockSeed = null;
+        job.rlSkySeed = null;
+        job.rustResult = null;
+        job.phase = Phase.RELIGHT;
+    }
+
+    private void beginRelightApply(Job job) {
+        job.pendingBlockLayers = new HashMap<>();
+        job.pendingSkyLayers = new HashMap<>();
+        job.blockSectionReady = new HashMap<>();
+        job.skySectionReady = new HashMap<>();
+        job.applyIndex = 0;
+        job.relightDone = 0;
+        job.phase = Phase.RELIGHT_APPLY;
+    }
+
+    /** 把 Rust 算好的結果寫回：能排隊寫入的 section 就排隊，還沒被 vanilla 認證過有資料的 fallback 逐格 checkBlock。 */
+    private boolean applyRustLightResult(Job job, long start, long budgetNanos) {
+        int width = job.rlWidth, height = job.rlHeight, length = job.rlLength;
+        int total = width * height * length;
+        LevelLightEngine lightEngine = job.level.getLightEngine();
+        RustLightEngine.Result result = job.rustResult;
+        while (job.applyIndex < total) {
+            int idx = job.applyIndex++;
+            int lz = idx % length;
+            int rem = idx / length;
+            int ly = rem % height;
+            int lx = rem / height;
+            BlockPos pos = new BlockPos(job.rlMinX + lx, job.rlMinY + ly, job.rlMinZ + lz);
+            applyRustLightForLayer(job, lightEngine, LightLayer.BLOCK, pos, result.blockLight()[idx],
+                    job.pendingBlockLayers, job.blockSectionReady);
+            applyRustLightForLayer(job, lightEngine, LightLayer.SKY, pos, result.skyLight()[idx],
+                    job.pendingSkyLayers, job.skySectionReady);
+            job.relightDone++;
+            if (job.relightDone % PROGRESS_CHECK_INTERVAL == 0 && System.nanoTime() - start > budgetNanos) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 見驗證報告「二點二十一」的實測發現：vanilla 的 queueSectionData 有一個 hasSection 閘門
+     * ——只有這個 section 已經被引擎認證為 LIGHT_AND_DATA，排隊寫入才會真的生效，否則永遠
+     * 卡在 pending 裡不生效也不報錯。剛生成/剛貼上、vanilla 還沒正式算過光的全新區域一律
+     * fallback 回 checkBlock，讓 vanilla 自己把它推進 LIGHT_AND_DATA 狀態。
+     */
+    private void applyRustLightForLayer(Job job, LevelLightEngine lightEngine, LightLayer layer, BlockPos pos,
+            byte value, Map<Long, DataLayer> pendingLayers, Map<Long, Boolean> readyCache) {
+        SectionPos sectionPos = SectionPos.of(pos);
+        long sectionKey = sectionPos.asLong();
+        Boolean ready = readyCache.get(sectionKey);
+        if (ready == null) {
+            ready = lightEngine.getDebugSectionType(layer, sectionPos) == LayerLightSectionStorage.SectionType.LIGHT_AND_DATA;
+            readyCache.put(sectionKey, ready);
+        }
+        if (!ready) {
+            lightEngine.checkBlock(pos);
+            return;
+        }
+        DataLayer layerData = pendingLayers.computeIfAbsent(sectionKey, k -> {
+            DataLayer existing = lightEngine.getLayerListener(layer).getDataLayerData(sectionPos);
+            return existing != null ? existing.copy() : new DataLayer();
+        });
+        int lx = SectionPos.sectionRelative(pos.getX());
+        int ly = SectionPos.sectionRelative(pos.getY());
+        int lz = SectionPos.sectionRelative(pos.getZ());
+        layerData.set(lx, ly, lz, value & 0xF);
+    }
+
+    private void flushPendingLightLayers(Job job) {
+        LevelLightEngine lightEngine = job.level.getLightEngine();
+        for (Map.Entry<Long, DataLayer> e : job.pendingBlockLayers.entrySet()) {
+            lightEngine.queueSectionData(LightLayer.BLOCK, SectionPos.of(e.getKey()), e.getValue());
+        }
+        for (Map.Entry<Long, DataLayer> e : job.pendingSkyLayers.entrySet()) {
+            lightEngine.queueSectionData(LightLayer.SKY, SectionPos.of(e.getKey()), e.getValue());
+        }
+        job.pendingBlockLayers = null;
+        job.pendingSkyLayers = null;
+        job.blockSectionReady = null;
+        job.skySectionReady = null;
+    }
+
+    /** 只算 box 邊界（不建立 iterator），供 {@link #beginRelightPhase} 判斷體積用。 */
+    private static int[] computeRelightBox(ChangeBuffer touched) {
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+        for (int i = 0; i < touched.size(); i++) {
+            BlockPos pos = BlockPos.of(touched.positionAt(i));
+            minX = Math.min(minX, pos.getX());
+            minY = Math.min(minY, pos.getY());
+            minZ = Math.min(minZ, pos.getZ());
+            maxX = Math.max(maxX, pos.getX());
+            maxY = Math.max(maxY, pos.getY());
+            maxZ = Math.max(maxZ, pos.getZ());
+        }
+        return new int[] {
+                minX - RELIGHT_BUFFER, minY - RELIGHT_BUFFER, minZ - RELIGHT_BUFFER,
+                maxX + RELIGHT_BUFFER, maxY + RELIGHT_BUFFER, maxZ + RELIGHT_BUFFER
+        };
     }
 
     private static final long ACTION_BAR_MIN_INTERVAL_MILLIS = 400L;
@@ -283,14 +568,32 @@ public final class UndoManager {
         String phaseLabel;
         int done;
         int total;
-        if (job.phase == Phase.WRITE) {
-            phaseLabel = "寫入";
-            done = job.touched;
-            total = job.record.changes.size();
-        } else {
-            phaseLabel = "重新算光";
-            done = job.relightDone;
-            total = job.relightTotal;
+        switch (job.phase) {
+            case WRITE -> {
+                phaseLabel = "寫入";
+                done = job.touched;
+                total = job.record.changes.size();
+            }
+            case RELIGHT_GATHER -> {
+                phaseLabel = "光罩計算池-讀取";
+                done = job.relightDone;
+                total = job.relightTotal;
+            }
+            case RELIGHT_WAIT -> {
+                phaseLabel = "光罩計算池-運算中";
+                done = job.relightTotal; // 純等待背景執行緒，沒有逐格進度可回報，先顯示成已完成讀取
+                total = job.relightTotal;
+            }
+            case RELIGHT_APPLY -> {
+                phaseLabel = "光罩計算池-寫回";
+                done = job.relightDone;
+                total = job.relightTotal;
+            }
+            default -> {
+                phaseLabel = "重新算光";
+                done = job.relightDone;
+                total = job.relightTotal;
+            }
         }
         int percent = total > 0 ? (int) (100L * done / total) : 100;
         String tierLabel = job.tier == SpeedTier.AUTO
@@ -316,40 +619,9 @@ public final class UndoManager {
      * 填充前的舊光值（例如整片本該全暗的內部仍讀到天空光 15）。此外緊鄰編輯範圍外側、
      * 理論上會被連帶影響但沒被直接寫入的「緩衝圈」也會漏算。解法：等這次操作的所有寫入
      * 都真正落地完成後，對整個 bounding box 再往外擴一圈（{@link #RELIGHT_BUFFER}）統一
-     * 重新 checkBlock 一次，讓光照引擎用「最終完整狀態」重算，而不是在填充過程中的中間
-     * 狀態就算數。
-     *
-     * 2026-09-13 速度分級改版：這裡改成回傳一個 lazy {@link Iterator}（包在 {@link RelightRange}
-     * 裡一併帶上總格數，供 actionbar 進度回報用），不再自己跑完整個三層迴圈——規格書 3.2 節
-     * 要求自動模式必須「同時控制方塊寫入預算跟丟進光照引擎的量／頻率」，relight 現在跟寫入
-     * 共用同一份每 tick 預算、可以跨多個 tick 完成，不會在收尾那一刻把前面節流省下的餘裕
-     * 一次爆光。只在寫入全部完成、世界已是最終狀態後才開始跑這個 iterator，順序跟舊版一致，
-     * 不影響上面那個光照 bug 的修復（2026-09-13 已用同一份 19200 格場景重跑回歸測試確認：
-     * 跨 tick 分批後的 relight 一樣收斂到 0 誤差，見驗證報告「二點十一」）。
+     * 重新算光一次，讓光照引擎用「最終完整狀態」重算，而不是在填充過程中的中間狀態就算數
+     * ——{@link #beginRelightPhase} 決定這一步是走 Rust 計算池還是舊版逐格 checkBlock。
      */
-    private static RelightRange buildRelightRange(ChangeBuffer touched) {
-        if (touched.isEmpty()) {
-            return new RelightRange(Collections.emptyIterator(), 0);
-        }
-        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
-        for (int i = 0; i < touched.size(); i++) {
-            BlockPos pos = BlockPos.of(touched.positionAt(i));
-            minX = Math.min(minX, pos.getX());
-            minY = Math.min(minY, pos.getY());
-            minZ = Math.min(minZ, pos.getZ());
-            maxX = Math.max(maxX, pos.getX());
-            maxY = Math.max(maxY, pos.getY());
-            maxZ = Math.max(maxZ, pos.getZ());
-        }
-        minX -= RELIGHT_BUFFER; minY -= RELIGHT_BUFFER; minZ -= RELIGHT_BUFFER;
-        maxX += RELIGHT_BUFFER; maxY += RELIGHT_BUFFER; maxZ += RELIGHT_BUFFER;
-        int total = (maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1);
-        return new RelightRange(new BoxIterator(minX, minY, minZ, maxX, maxY, maxZ), total);
-    }
-
-    private record RelightRange(Iterator<BlockPos> iterator, int total) {
-    }
 
     /** 對一個立方體範圍逐格產生 {@link BlockPos}，不預先展開成 List——大範圍 relight 不會佔用額外記憶體。 */
     private static final class BoxIterator implements Iterator<BlockPos> {
@@ -465,7 +737,7 @@ public final class UndoManager {
      * light section「是否為空」bookkeeping 的更新——導致光照引擎誤以為該欄位還是空的，
      * 大範圍實心填充後內部仍讀到滿天空光。改呼叫 {@code LevelChunk#setBlockState}
      * （比 section 低階寫入高一層，仍然跳過 {@code Level.setBlock} 的鄰居通知/紅石/物理），
-     * 這樣 heightmap 與 light section 狀態都會正確更新，讓後續 {@link #buildRelightRange}
+     * 這樣 heightmap 與 light section 狀態都會正確更新，讓後續 {@link #beginRelightPhase}
      * 產生的 RELIGHT 階段能算出正確結果。
      */
     static void applyChange(ServerLevel level, BlockPos pos, BlockState targetState, CompoundTag targetNbt) {
