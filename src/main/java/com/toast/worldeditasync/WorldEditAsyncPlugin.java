@@ -57,7 +57,9 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
 
     private boolean editSessionHookRegistered = false;
     private volatile boolean adapterRegistered = false;
-    // -1 = 尚未跑過/反射結構性失敗；>=0 = 成功重建，值為實際帶有屬性的方塊型別數。
+    // -1 = 尚未跑過/反射結構性失敗；-2 = 官方 adapter 已存在，不需要我們的修補；
+    // >=0 = 我們自己重建成功，值為實際帶有屬性的方塊型別數。
+    private static final int PROPERTY_REGISTRY_SKIPPED_OFFICIAL_ADAPTER = -2;
     private volatile int propertyRegistryFixedCount = -1;
     private volatile boolean engineEnabled = false;
     // 診斷用暫時開關：僅供重現/排除原生崩潰場景時使用，正常使用不應開啟。
@@ -103,7 +105,24 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     }
 
     /**
-     * 把 {@link WEBukkitAdapter} 塞進 WorldEdit 自己的 adapter 欄位。
+     * 把 {@link WEBukkitAdapter} 塞進 WorldEdit 自己的 adapter 欄位——但只在「這個平台
+     * 真的沒有官方 adapter」時才做。
+     *
+     * 2026-09-15 委託人的建築服環境（純 PaperMC，不是 Arclight）暴露了一個沒考慮到的情境：
+     * 純 Paper 本身就在 WorldEdit 官方原生 adapter 清單裡，{@code WorldEditPlugin} 自己的
+     * {@code loadAdapter()} 在啟動時就已經找到並注入了官方 adapter。這個方法原本無條件執行
+     * 反射注入，會把官方已經裝好的 adapter **蓋掉**，換成我們這個功能刻意做得比較少的最小
+     * 實作（例如 {@link WEBukkitAdapter} 完全不支援地形重生成、自訂生物群系等）——等於在
+     * 一個原本就正常的環境上，把功能完整的官方實作換成一個閹割版，是純粹的倒退，不是修復。
+     *
+     * 修法：反射拿到 {@code adapter} 欄位（本來就需要，見下方）後，先問它「現在已經有
+     * adapter 了嗎」——這一步不需要額外反射，直接把欄位值轉型成它實作的公開介面
+     * {@code com.sk89q.worldedit.util.lifecycle.Lifecycled} 呼叫公開方法 {@code isValid()}
+     * 即可（{@code WorldEditPlugin} 自己對外的 getter 是 package-private，叫不到，但介面
+     * 本身是 public，轉型呼叫合法）。已經有效就代表這個平台（不管是純 Paper 還是任何未來
+     * 版本 Arclight 補齊了官方支援）已經有可用的官方實作，直接跳過，讀取/寫入/屬性表全部
+     * 交給官方 adapter 負責，不去動它。只有無效（目前只在 Arclight 這種缺官方 adapter 的
+     * 環境會發生）才繼續執行下面這段注入。
      *
      * WorldEdit 在自己的 onEnable（比我們早，因為 plugin.yml 宣告 depend: [WorldEdit]）
      * 掃描 classpath 尋找官方 adapter 失敗後，會把內部的 {@code SimpleLifecycled<BukkitImplAdapter>}
@@ -131,6 +150,18 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                     com.sk89q.worldedit.bukkit.WorldEditPlugin.class.getDeclaredField("adapter");
             adapterField.setAccessible(true);
             Object lifecycled = adapterField.get(worldEditPlugin);
+            // WorldEditPlugin#getBukkitImplAdapter()/getLifecycledBukkitImplAdapter() 都是
+            // package-private（反解確認 flags=0x0000），從我們自己的套件叫不到，但這個欄位
+            // 實際型別 SimpleLifecycled 實作了公開介面 com.sk89q.worldedit.util.lifecycle.Lifecycled
+            // ——轉型成這個公開介面型別後就能直接呼叫它的公開方法（isValid()），不需要碰任何
+            // package-private 成員，也不用另外反射一個 getter。
+            if (lifecycled instanceof com.sk89q.worldedit.util.lifecycle.Lifecycled<?> existing && existing.isValid()) {
+                adapterRegistered = true;
+                propertyRegistryFixedCount = PROPERTY_REGISTRY_SKIPPED_OFFICIAL_ADAPTER;
+                getLogger().info("[WEPoC] 偵測到這個平台已經有官方 BukkitImplAdapter（例如純 Paper），"
+                        + "不注入我們自己的最小實作，讀取/寫入/屬性表全部交給官方 adapter 負責");
+                return;
+            }
             java.lang.reflect.Method newValue = lifecycled.getClass().getMethod("newValue", Object.class);
             WEBukkitAdapter bukkitAdapter = new WEBukkitAdapter();
             newValue.invoke(lifecycled, bukkitAdapter);
@@ -327,9 +358,11 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             case "hookstatus":
                 sender.sendMessage("[WEPoC] EditSessionEvent 已註冊: " + editSessionHookRegistered
                         + " BukkitImplAdapter 已註冊: " + adapterRegistered
-                        + " property registry 重建: " + (propertyRegistryFixedCount < 0
-                                ? "失敗（見啟動 log，屬性語法/copy-paste 屬性保留已回歸遺失狀態）"
-                                : (propertyRegistryFixedCount + " 個型別帶屬性"))
+                        + " property registry 重建: " + (propertyRegistryFixedCount == PROPERTY_REGISTRY_SKIPPED_OFFICIAL_ADAPTER
+                                ? "不需要（官方 adapter 已存在）"
+                                : propertyRegistryFixedCount < 0
+                                        ? "失敗（見啟動 log，屬性語法/copy-paste 屬性保留已回歸遺失狀態）"
+                                        : (propertyRegistryFixedCount + " 個型別帶屬性"))
                         + " engine=" + (engineEnabled ? "on" : "off"));
                 return true;
             case "mspt":

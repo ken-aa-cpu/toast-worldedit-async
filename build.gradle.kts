@@ -11,7 +11,7 @@ repositories {
     maven { url = uri("https://maven.enginehub.org/repo/") }
 }
 
-val serverDir = "../../伺服器本體/主混端伺服器"
+val serverDir = "../../../伺服器本體/主混端伺服器"
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.1-R0.1-SNAPSHOT")
