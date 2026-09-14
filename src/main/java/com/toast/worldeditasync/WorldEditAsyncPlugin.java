@@ -85,6 +85,31 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
 
     private static final long PENDING_TIER_TTL_MILLIS = 5000L;
     private final Map<UUID, PendingTier> pendingTierByActor = new ConcurrentHashMap<>();
+
+    /**
+     * 2026-09-15 委託人拿一個 5676 萬格的城堡 schematic 做壓力測試後提出的安全閘：任何預估
+     * 會動到超過 {@link #DANGER_BLOCK_THRESHOLD} 格的操作（選區類指令看目前選區體積、
+     * {@code //paste} 看 clipboard 體積），一律先擋下來，要求玩家先送出 {@code /wepoc danger
+     * confirm} 才會放行——而且只放行「確認後的下一個 WorldEdit 指令」這一次，用一次就丟
+     * （跟 {@link #pendingTierByActor} 同一種「用一次就丟＋TTL 防呆」模式）。委託人明確
+     * 要求的語意：如果確認後玩家送出的下一個指令根本不是 WorldEdit 操作指令，這次確認直接
+     * 失效，不能留著等下一次真的送操作指令時才用掉——見 {@link #onCommandPreprocess} 開頭
+     * 那段判斷。
+     *
+     * 只用「選區/clipboard 的體積」而不是「實際會被改到的格數」來估計，是刻意的簡化：
+     * 前者在指令真正執行前就能查到（`//replace` 之類的指令實際影響格數必須跑完才知道），
+     * 用體積當保守上限（worst case）估計，足以擋下真正危險的大範圍操作，不需要先跑一次
+     * 才知道要不要擋。
+     */
+    // 2026-09-15 用真實壓力測試校正過的數字：5676 萬格的城堡同步貼上，玩家看到「完成」
+    // 訊息花了 81 秒（實際主執行緒卡住時間更長——WorldEdit 自己的原生 history 收尾還要
+    // 再花時間，見驗證報告「二點十八」），已經超過 Paper 預設 60 秒看門狗時限。反推吞吐量
+    // 約 70 萬格/秒，用預設看門狗時限反推大概 4200 萬格左右就會開始踩線，原本訂的 1 億格
+    // 明顯太高——2000 萬格留了足夠安全邊際（且這次測試的城堡屬性複雜度不低，實際門檻
+    // 可能因方塊種類更單純而更高，這裡刻意保守）。
+    private static final long DANGER_BLOCK_THRESHOLD = 20_000_000L;
+    private static final long DANGER_CONFIRM_TTL_MILLIS = 30_000L;
+    private final Map<UUID, Long> pendingDangerConfirmByActor = new ConcurrentHashMap<>();
     private UndoManager undoManager;
 
     @Override
@@ -218,8 +243,33 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         }
         String cmd = parts[0].toLowerCase(Locale.ROOT);
         boolean isWorldEditNamespace = cmd.startsWith("//") || UNDO_REDO_COMMANDS.contains(cmd);
+        Player player = event.getPlayer();
+
         if (!isWorldEditNamespace) {
+            // 委託人明確要求的語意：danger confirm 只保護「確認後緊接著送出的下一個指令」，
+            // 如果那個指令根本不是 WorldEdit 操作指令，確認就直接失效，不能留到之後真的送出
+            // 操作指令時才被撿去用。
+            pendingDangerConfirmByActor.remove(player.getUniqueId());
             return;
+        }
+
+        if (!UNDO_REDO_COMMANDS.contains(cmd)) {
+            Long confirmedAtMillis = pendingDangerConfirmByActor.remove(player.getUniqueId());
+            boolean dangerConfirmed = confirmedAtMillis != null
+                    && System.currentTimeMillis() - confirmedAtMillis <= DANGER_CONFIRM_TTL_MILLIS;
+            if (!dangerConfirmed) {
+                long estimatedVolume = estimateOperationVolume(player, cmd);
+                if (estimatedVolume > DANGER_BLOCK_THRESHOLD) {
+                    event.setCancelled(true);
+                    player.sendMessage(String.format(Locale.ROOT,
+                            "[WEPoC] 這個操作預估會動到約 %,d 格，超過 %,d 格的危險門檻——有很大的風險"
+                                    + "（可能長時間卡住主執行緒，甚至觸發看門狗強制關伺服器）。"
+                                    + "確定要繼續的話，請先輸入 /wepoc danger confirm，緊接著（%d 秒內）"
+                                    + "再送出這個指令一次。",
+                            estimatedVolume, DANGER_BLOCK_THRESHOLD, DANGER_CONFIRM_TTL_MILLIS / 1000));
+                    return;
+                }
+            }
         }
 
         SpeedTier tier = SpeedTier.MID;
@@ -228,7 +278,6 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             parts = Arrays.copyOf(parts, parts.length - 1);
         }
 
-        Player player = event.getPlayer();
         if (UNDO_REDO_COMMANDS.contains(cmd)) {
             event.setCancelled(true);
             ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
@@ -263,10 +312,34 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     private void sweepStalePendingTiers() {
         long now = System.currentTimeMillis();
         pendingTierByActor.entrySet().removeIf(e -> now - e.getValue().insertedAtMillis() > PENDING_TIER_TTL_MILLIS);
+        // 見 pendingDangerConfirmByActor 欄位註解：正常情況下會在下一個指令就被消費/清掉，
+        // 這裡只是保底，避免玩家確認完之後完全不再送任何指令，殘留一筆永遠用不到的確認。
+        pendingDangerConfirmByActor.entrySet().removeIf(e -> now - e.getValue() > DANGER_CONFIRM_TTL_MILLIS);
     }
 
     private static boolean isTierKeyword(String token) {
         return TIER_COMPLETION_WORDS.contains(token.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * 危險操作防呆的體積估計：用「選區/clipboard 的體積」當保守上限，不是「實際會被改到的
+     * 格數」（後者要跑完才知道）。{@code //paste} 看 clipboard 體積，其餘看目前選區體積。
+     * 查不到（選區沒設好、clipboard 是空的、任何反解沒預期到的例外）就回傳 0——不擋，讓
+     * WorldEdit 自己既有的錯誤訊息（"Make a region selection first." 等）去處理，不在這裡
+     * 越權搶著報錯。
+     */
+    private long estimateOperationVolume(Player player, String cmd) {
+        try {
+            com.sk89q.worldedit.entity.Player weActor = BukkitAdapter.adapt(player);
+            com.sk89q.worldedit.LocalSession session = WorldEdit.getInstance().getSessionManager().get(weActor);
+            if (cmd.equals("//paste")) {
+                return session.getClipboard().getClipboard().getRegion().getVolume();
+            }
+            com.sk89q.worldedit.world.World world = BukkitAdapter.adapt(player.getWorld());
+            return session.getSelection(world).getVolume();
+        } catch (Throwable t) {
+            return 0L;
+        }
     }
 
     /**
@@ -351,7 +424,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo> [args]");
+            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -383,8 +456,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                 return handleBlockDiff(sender, args);
             case "propdump":
                 return handlePropDump(sender, args);
+            case "danger":
+                return handleDangerConfirm(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff> [args]");
+                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger> [args]");
                 return true;
         }
     }
@@ -522,6 +597,26 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         }
         sender.sendMessage("[WEPoC] " + args[1] + " getPropertyMap keys=" + type.getPropertyMap().keySet());
         sender.sendMessage("[WEPoC] defaultState=" + type.getDefaultState());
+        return true;
+    }
+
+    // 見 pendingDangerConfirmByActor 欄位註解。/wepoc danger confirm
+    private boolean handleDangerConfirm(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            sender.sendMessage("需在遊戲內執行");
+            return true;
+        }
+        if (args.length < 2 || !args[1].equalsIgnoreCase("confirm")) {
+            sender.sendMessage("用法: /wepoc danger confirm（用來放行上一個因為預估影響格數"
+                    + "超過 " + String.format(Locale.ROOT, "%,d", DANGER_BLOCK_THRESHOLD) + " 格被擋下的操作，"
+                    + "只對「緊接著送出的下一個指令」有效，用一次就丟）");
+            return true;
+        }
+        pendingDangerConfirmByActor.put(player.getUniqueId(), System.currentTimeMillis());
+        sender.sendMessage(String.format(Locale.ROOT,
+                "[WEPoC] 危險操作已確認，%d 秒內送出的下一個 WorldEdit 指令會被放行一次"
+                        + "（不管那個指令實際大小），送出其他任何指令都會讓這次確認失效。",
+                DANGER_CONFIRM_TTL_MILLIS / 1000));
         return true;
     }
 
