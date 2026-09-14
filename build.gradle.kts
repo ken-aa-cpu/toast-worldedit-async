@@ -1,3 +1,5 @@
+import org.apache.tools.ant.taskdefs.condition.Os
+
 plugins {
     id("java")
 }
@@ -36,4 +38,32 @@ tasks.withType<JavaCompile>().configureEach {
 
 tasks.jar {
     archiveBaseName.set("Toast_WorldEditAsync")
+}
+
+// ---------------------------------------------------------------------------
+// 光罩計算池：Rust native 編譯與動態庫打包（沿用 02-rust-jni-addon-template 的模式）
+// ---------------------------------------------------------------------------
+val cargoBuildLight = tasks.register<Exec>("cargoBuildLight") {
+    group = "build"
+    description = "編譯光罩計算池的 Rust cdylib"
+    workingDir = file("rust-core")
+    if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+        commandLine("cmd", "/c", "cargo build --release")
+    } else {
+        commandLine("cargo", "build", "--release")
+    }
+}
+
+val copyLightNatives = tasks.register<Copy>("copyLightNatives") {
+    dependsOn(cargoBuildLight)
+    group = "build"
+    description = "把編譯好的光罩計算池動態庫複製進 resources，隨插件 jar 一起打包"
+    from(file("rust-core/target/release")) {
+        include("*.dll", "*.so", "*.dylib")
+    }
+    into(file("src/main/resources/natives/windows-x86_64"))
+}
+
+tasks.named("processResources") {
+    dependsOn(copyLightNatives)
 }

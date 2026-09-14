@@ -3,3 +3,5 @@ build/
 /com/
 /nms_extract/
 /we_extract/
+/rust-core/target/
+/src/main/resources/natives/

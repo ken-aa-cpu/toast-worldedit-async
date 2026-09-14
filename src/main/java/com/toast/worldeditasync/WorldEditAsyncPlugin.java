@@ -6,6 +6,7 @@ import com.sk89q.worldedit.WorldEditException;
 import com.sk89q.worldedit.bukkit.BukkitAdapter;
 import com.sk89q.worldedit.event.extent.EditSessionEvent;
 import com.sk89q.worldedit.util.eventbus.Subscribe;
+import com.toast.worldeditasync.light.RustLightEngine;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -444,7 +445,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest> [args]");
+            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -480,8 +481,12 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                 return handleDangerConfirm(sender, args);
             case "noactortest":
                 return handleNoActorTest(sender, args);
+            case "rustlighttest":
+                return handleRustLightTest(sender, args);
+            case "lightwritetest":
+                return handleLightWriteTest(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest> [args]");
+                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest> [args]");
                 return true;
         }
     }
@@ -666,6 +671,188 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             sender.sendMessage("座標必須是整數");
         } catch (WorldEditException e) {
             sender.sendMessage("[WEPoC] noactortest 失敗: " + e);
+        }
+        return true;
+    }
+
+    /**
+     * 光罩計算池（Rust）的獨立驗證指令，不碰 {@link UndoManager} 的正式 RELIGHT 路徑——
+     * 只是把指定範圍（+外擴緩衝圈）的既有方塊資料讀出來、丟給 Rust 算一次，跟世界裡
+     * 「已經是 vanilla 自己算出來的正確值」逐格比對，確認演算法本身站得住腳，再考慮接進
+     * 正式路徑。驗收標準（委託人拍板）：不要求逐格完全一致，容許小幅落差（±1 算符合），
+     * 只看整體有沒有大範圍離譜偏差。
+     * /wepoc rustlighttest x1 y1 z1 x2 y2 z2
+     */
+    private boolean handleRustLightTest(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player) || args.length < 7) {
+            sender.sendMessage("用法: /wepoc rustlighttest x1 y1 z1 x2 y2 z2"
+                    + "（拿範圍內既有的 vanilla 光值當 ground truth，驗證 Rust 光罩計算池算出來的值有多接近）");
+            return true;
+        }
+        if (!RustLightEngine.isAvailable(getLogger())) {
+            sender.sendMessage("[WEPoC] 光罩計算池 native 函式庫沒有成功載入，無法測試（見啟動 log）");
+            return true;
+        }
+        try {
+            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
+            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
+            int buffer = 2;
+            int minX = Math.min(x1, x2) - buffer, maxX = Math.max(x1, x2) + buffer;
+            int minY = Math.min(y1, y2) - buffer, maxY = Math.max(y1, y2) + buffer;
+            int minZ = Math.min(z1, z2) - buffer, maxZ = Math.max(z1, z2) + buffer;
+            int width = maxX - minX + 1, height = maxY - minY + 1, length = maxZ - minZ + 1;
+            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
+
+            byte[] opacity = new byte[width * height * length];
+            byte[] blockSeed = new byte[width * height * length];
+            byte[] skySeed = new byte[width * height * length];
+            byte[] groundTruthBlock = new byte[width * height * length];
+            byte[] groundTruthSky = new byte[width * height * length];
+            var blockListener = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
+            var skyListener = level.getLightEngine().getLayerListener(LightLayer.SKY);
+
+            for (int x = 0; x < width; x++) {
+                for (int y = 0; y < height; y++) {
+                    for (int z = 0; z < length; z++) {
+                        BlockPos pos = new BlockPos(minX + x, minY + y, minZ + z);
+                        int idx = ((x * height) + y) * length + z;
+                        BlockState state = level.getBlockState(pos);
+                        opacity[idx] = (byte) state.getLightBlock(level, pos);
+                        int actualBlockLight = blockListener.getLightValue(pos);
+                        int actualSkyLight = skyListener.getLightValue(pos);
+                        groundTruthBlock[idx] = (byte) actualBlockLight;
+                        groundTruthSky[idx] = (byte) actualSkyLight;
+
+                        boolean isBoundaryShell = x == 0 || y == 0 || z == 0
+                                || x == width - 1 || y == height - 1 || z == length - 1;
+                        int emission = state.getLightEmission();
+                        if (isBoundaryShell) {
+                            blockSeed[idx] = (byte) actualBlockLight;
+                            skySeed[idx] = (byte) actualSkyLight;
+                        } else if (emission > 0) {
+                            blockSeed[idx] = (byte) emission;
+                            skySeed[idx] = -1;
+                        } else {
+                            blockSeed[idx] = -1;
+                            skySeed[idx] = -1;
+                        }
+                    }
+                }
+            }
+
+            final int w = width, h = height, l = length;
+            new Thread(() -> {
+                var resultOpt = RustLightEngine.tryComputeLight(getLogger(), w, h, l, opacity, blockSeed, skySeed);
+                Bukkit.getScheduler().runTask(this, () -> {
+                    if (resultOpt.isEmpty()) {
+                        sender.sendMessage("[WEPoC] rustlighttest 失敗：光罩計算池呼叫失敗（見 log），fallback 情境本身也算驗證過了");
+                        return;
+                    }
+                    RustLightEngine.Result result = resultOpt.get();
+                    int total = 0, exactBlock = 0, closeBlock = 0, exactSky = 0, closeSky = 0;
+                    int worstBlockDiff = 0, worstSkyDiff = 0;
+                    for (int x = 1; x < w - 1; x++) {
+                        for (int y = 1; y < h - 1; y++) {
+                            for (int z = 1; z < l - 1; z++) {
+                                int idx = ((x * h) + y) * l + z;
+                                total++;
+                                int diffBlock = Math.abs(result.blockLight()[idx] - groundTruthBlock[idx]);
+                                int diffSky = Math.abs(result.skyLight()[idx] - groundTruthSky[idx]);
+                                worstBlockDiff = Math.max(worstBlockDiff, diffBlock);
+                                worstSkyDiff = Math.max(worstSkyDiff, diffSky);
+                                if (diffBlock == 0) {
+                                    exactBlock++;
+                                }
+                                if (diffBlock <= 1) {
+                                    closeBlock++;
+                                }
+                                if (diffSky == 0) {
+                                    exactSky++;
+                                }
+                                if (diffSky <= 1) {
+                                    closeSky++;
+                                }
+                            }
+                        }
+                    }
+                    sender.sendMessage(String.format(Locale.ROOT,
+                            "[WEPoC] rustlighttest 內部 %d 格（不含外圈緩衝）：方塊光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d"
+                                    + " | 天空光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d",
+                            total, exactBlock, 100.0 * exactBlock / total, closeBlock, 100.0 * closeBlock / total, worstBlockDiff,
+                            exactSky, 100.0 * exactSky / total, closeSky, 100.0 * closeSky / total, worstSkyDiff));
+                });
+            }, "wepoc-rustlighttest").start();
+            sender.sendMessage("[WEPoC] rustlighttest 已送出到背景執行緒計算，範圍 " + width + "x" + height + "x" + length + "，稍後回報結果...");
+        } catch (NumberFormatException e) {
+            sender.sendMessage("座標必須是整數");
+        }
+        return true;
+    }
+
+    /**
+     * 驗證「直接把光值寫回世界」這條路徑本身能不能用——跟 {@link #handleRustLightTest}
+     * 驗證的是完全不同的事（那個只驗證演算法算出來的值準不準，這個不碰演算法，只驗證
+     * {@code DataLayer}/{@code LevelLightEngine#queueSectionData} 這條寫入機制本身有沒有
+     * 真的生效、query 得到）。故意先把值改壞、讀回確認真的變壞（證明寫入不是空氣），
+     * 再用原本備份的 {@code DataLayer} 整份還原、讀回確認真的還原——全程不留任何實際
+     * 破壞。/wepoc lightwritetest x y z
+     */
+    private boolean handleLightWriteTest(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player) || args.length < 4) {
+            sender.sendMessage("用法: /wepoc lightwritetest x y z（測試 DataLayer/queueSectionData 直接寫光值這條路徑本身能不能用，全程會還原、不留破壞）");
+            return true;
+        }
+        try {
+            int x = Integer.parseInt(args[1]), y = Integer.parseInt(args[2]), z = Integer.parseInt(args[3]);
+            BlockPos pos = new BlockPos(x, y, z);
+            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
+            var lightEngine = level.getLightEngine();
+            var blockListener = lightEngine.getLayerListener(LightLayer.BLOCK);
+            net.minecraft.core.SectionPos sectionPos = net.minecraft.core.SectionPos.of(pos);
+
+            int originalValue = blockListener.getLightValue(pos);
+            net.minecraft.world.level.chunk.DataLayer existing = blockListener.getDataLayerData(sectionPos);
+            net.minecraft.world.level.chunk.DataLayer backup = existing != null ? existing.copy()
+                    : new net.minecraft.world.level.chunk.DataLayer();
+
+            int localX = net.minecraft.core.SectionPos.sectionRelative(x);
+            int localY = net.minecraft.core.SectionPos.sectionRelative(y);
+            int localZ = net.minecraft.core.SectionPos.sectionRelative(z);
+            int corruptedValue = (originalValue + 5) % 16;
+
+            net.minecraft.world.level.chunk.DataLayer corrupted = backup.copy();
+            corrupted.set(localX, localY, localZ, corruptedValue);
+            // 2026-09-15 發現：這台 Paper 伺服器的 getLightEngine() 回傳的是 Paper 自己的
+            // ThreadedLevelLightEngine——光照運算本來就已經跑在專屬背景執行緒，runLightUpdates()
+            // 是它自己排程用的內部方法，外部手動呼叫會直接丟 UnsupportedOperationException
+            // （"Ran automatically on a different thread!"）。改成單純 queueSectionData 排隊，
+            // 交給它自己的排程機制非同步處理，延遲幾個 tick 後才讀回檢查有沒有生效。
+            lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, corrupted);
+            sender.sendMessage(String.format(Locale.ROOT,
+                    "[WEPoC] lightwritetest: 原值=%d，已排隊改成=%d，1 秒後讀回確認+還原...",
+                    originalValue, corruptedValue));
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                int afterCorrupt = blockListener.getLightValue(pos);
+                boolean writeWorked = afterCorrupt == corruptedValue;
+                sender.sendMessage(String.format(Locale.ROOT,
+                        "[WEPoC] lightwritetest: 讀回=%d（寫入%s生效），現在排隊還原...",
+                        afterCorrupt, writeWorked ? "有" : "沒有"));
+                lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, backup);
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    int afterRestore = blockListener.getLightValue(pos);
+                    boolean restoreWorked = afterRestore == originalValue;
+                    sender.sendMessage(String.format(Locale.ROOT,
+                            "[WEPoC] lightwritetest: 還原後讀回=%d（還原%s成功）",
+                            afterRestore, restoreWorked ? "" : "沒有"));
+                    if (!writeWorked) {
+                        sender.sendMessage("[WEPoC] !!! queueSectionData 這條路徑目前看起來沒有真的生效，不能拿來取代 checkBlock !!!");
+                    } else if (!restoreWorked) {
+                        sender.sendMessage("[WEPoC] !!! 還原失敗，這個位置的光值可能被改壞了，建議手動 /wepoc write 或重載該 chunk !!!");
+                    }
+                }, 20L);
+            }, 20L);
+        } catch (NumberFormatException e) {
+            sender.sendMessage("座標必須是整數");
         }
         return true;
     }
