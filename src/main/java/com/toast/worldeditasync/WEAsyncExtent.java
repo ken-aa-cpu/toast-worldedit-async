@@ -14,8 +14,6 @@ import org.bukkit.block.data.BlockData;
 import org.bukkit.craftbukkit.v1_21_R1.block.data.CraftBlockData;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -35,16 +33,21 @@ public final class WEAsyncExtent extends AbstractDelegateExtent {
 
     private final ServerLevel level;
     private final JavaPlugin plugin;
-    private final Map<BlockPos, ChangeEntry> changes = new LinkedHashMap<>();
+    private final ChangeBuffer changes;
     private final AtomicLong fallbackCount = new AtomicLong();
 
     public WEAsyncExtent(Extent delegate, ServerLevel level, JavaPlugin plugin) {
+        this(delegate, level, plugin, 4096);
+    }
+
+    public WEAsyncExtent(Extent delegate, ServerLevel level, JavaPlugin plugin, int expectedSize) {
         super(delegate);
         this.level = level;
         this.plugin = plugin;
+        this.changes = new ChangeBuffer(expectedSize);
     }
 
-    public Map<BlockPos, ChangeEntry> getChanges() {
+    public ChangeBuffer getChanges() {
         return changes;
     }
 
@@ -73,9 +76,9 @@ public final class WEAsyncExtent extends AbstractDelegateExtent {
     public com.sk89q.worldedit.world.block.BlockState getBlock(BlockVector3 position) {
         try {
             BlockPos pos = new BlockPos(position.x(), position.y(), position.z());
-            ChangeEntry pending = changes.get(pos);
+            int idx = changes.indexOf(pos.asLong());
             net.minecraft.world.level.block.state.BlockState nmsState =
-                    pending != null ? pending.afterState : level.getBlockState(pos);
+                    idx >= 0 ? changes.afterStateAt(idx) : level.getBlockState(pos);
             BlockData bukkitData = CraftBlockData.fromData(nmsState);
             return BukkitAdapter.adapt(bukkitData);
         } catch (Throwable t) {
@@ -103,21 +106,21 @@ public final class WEAsyncExtent extends AbstractDelegateExtent {
             BlockData bukkitData = BukkitAdapter.adapt(block);
             net.minecraft.world.level.block.state.BlockState nmsState = ((CraftBlockData) bukkitData).getState();
             BlockPos pos = new BlockPos(position.x(), position.y(), position.z());
+            long packed = pos.asLong();
 
-            ChangeEntry entry = changes.get(pos);
-            if (entry == null) {
+            int idx = changes.indexOf(packed);
+            if (idx < 0) {
                 net.minecraft.world.level.block.state.BlockState beforeState = level.getBlockState(pos);
                 BlockEntity beforeBe = level.getBlockEntity(pos);
                 CompoundTag beforeNbt = beforeBe != null ? beforeBe.saveWithFullMetadata(level.registryAccess()) : null;
-                entry = new ChangeEntry(beforeState, beforeNbt);
-                changes.put(pos, entry);
+                idx = changes.recordFirstSeen(packed, beforeState, beforeNbt);
             }
 
             // 目前尚未接上 WorldEdit 目標方塊本身攜帶的 NBT 轉換（該轉換正是官方 adapter
             // 負責的事，此環境沒有能用的 adapter）。落地時若目標方塊需要 block entity，
             // 只會建立一個乾淨初始化的空白實體 —— 這與規格書第 0 節引用的 WorldEdit 官方
             // 警告（"chests will be empty"）在同一環境下的既有限制一致，不是本次倒退。
-            entry.recordAfter(nmsState, null);
+            changes.recordAfter(idx, nmsState, null);
             return true;
         } catch (Throwable t) {
             fallbackCount.incrementAndGet();

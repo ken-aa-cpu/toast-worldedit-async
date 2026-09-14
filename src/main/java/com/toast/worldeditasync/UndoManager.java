@@ -71,7 +71,7 @@ public final class UndoManager {
         final EditRecord record;
         final ServerLevel level;
         final SpeedTier tier;
-        final Iterator<Map.Entry<BlockPos, ChangeEntry>> writeIterator;
+        int writeIndex = 0;
         Phase phase = Phase.WRITE;
         Iterator<BlockPos> relightIterator;
         int touched = 0;
@@ -84,7 +84,6 @@ public final class UndoManager {
             this.record = record;
             this.level = level;
             this.tier = tier;
-            this.writeIterator = record.changes.entrySet().iterator();
         }
     }
 
@@ -215,12 +214,13 @@ public final class UndoManager {
         boolean yielded = false;
 
         if (job.phase == Phase.WRITE) {
-            while (job.writeIterator.hasNext()) {
-                Map.Entry<BlockPos, ChangeEntry> entry = job.writeIterator.next();
-                ChangeEntry ce = entry.getValue();
+            ChangeBuffer changes = job.record.changes;
+            while (job.writeIndex < changes.size()) {
+                int i = job.writeIndex++;
+                BlockPos pos = BlockPos.of(changes.positionAt(i));
                 switch (job.type) {
-                    case FORWARD, REDO -> applyChange(job.level, entry.getKey(), ce.afterState, ce.afterNbt);
-                    case UNDO -> applyChange(job.level, entry.getKey(), ce.beforeState, ce.beforeNbt);
+                    case FORWARD, REDO -> applyChange(job.level, pos, changes.afterStateAt(i), changes.afterNbtAt(i));
+                    case UNDO -> applyChange(job.level, pos, changes.beforeStateAt(i), changes.beforeNbtAt(i));
                 }
                 job.touched++;
                 if (job.touched % PROGRESS_CHECK_INTERVAL == 0 && System.nanoTime() - start > budgetNanos) {
@@ -230,7 +230,7 @@ public final class UndoManager {
             }
             if (!yielded) {
                 job.phase = Phase.RELIGHT;
-                RelightRange range = buildRelightRange(job.record.changes.keySet());
+                RelightRange range = buildRelightRange(changes);
                 job.relightIterator = range.iterator();
                 job.relightTotal = range.total();
             }
@@ -327,13 +327,14 @@ public final class UndoManager {
      * 不影響上面那個光照 bug 的修復（2026-09-13 已用同一份 19200 格場景重跑回歸測試確認：
      * 跨 tick 分批後的 relight 一樣收斂到 0 誤差，見驗證報告「二點十一」）。
      */
-    private static RelightRange buildRelightRange(Set<BlockPos> touched) {
+    private static RelightRange buildRelightRange(ChangeBuffer touched) {
         if (touched.isEmpty()) {
             return new RelightRange(Collections.emptyIterator(), 0);
         }
         int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
         int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
-        for (BlockPos pos : touched) {
+        for (int i = 0; i < touched.size(); i++) {
+            BlockPos pos = BlockPos.of(touched.positionAt(i));
             minX = Math.min(minX, pos.getX());
             minY = Math.min(minY, pos.getY());
             minZ = Math.min(minZ, pos.getZ());

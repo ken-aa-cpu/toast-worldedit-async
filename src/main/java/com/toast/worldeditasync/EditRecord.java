@@ -1,8 +1,5 @@
 package com.toast.worldeditasync;
 
-import net.minecraft.core.BlockPos;
-
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -14,9 +11,9 @@ public final class EditRecord {
     final UUID actor;
     final String worldKey;
     final long timestamp;
-    final Map<BlockPos, ChangeEntry> changes;
+    final ChangeBuffer changes;
 
-    EditRecord(UUID actor, String worldKey, Map<BlockPos, ChangeEntry> changes) {
+    EditRecord(UUID actor, String worldKey, ChangeBuffer changes) {
         this.actor = actor;
         this.worldKey = worldKey;
         this.timestamp = System.currentTimeMillis();
