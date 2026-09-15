@@ -105,27 +105,40 @@ public final class WEAsyncExtent extends AbstractDelegateExtent {
         try {
             BlockData bukkitData = BukkitAdapter.adapt(block);
             net.minecraft.world.level.block.state.BlockState nmsState = ((CraftBlockData) bukkitData).getState();
-            BlockPos pos = new BlockPos(position.x(), position.y(), position.z());
-            long packed = pos.asLong();
-
-            int idx = changes.indexOf(packed);
-            if (idx < 0) {
-                net.minecraft.world.level.block.state.BlockState beforeState = level.getBlockState(pos);
-                BlockEntity beforeBe = level.getBlockEntity(pos);
-                CompoundTag beforeNbt = beforeBe != null ? beforeBe.saveWithFullMetadata(level.registryAccess()) : null;
-                idx = changes.recordFirstSeen(packed, beforeState, beforeNbt);
-            }
-
-            // 目前尚未接上 WorldEdit 目標方塊本身攜帶的 NBT 轉換（該轉換正是官方 adapter
-            // 負責的事，此環境沒有能用的 adapter）。落地時若目標方塊需要 block entity，
-            // 只會建立一個乾淨初始化的空白實體 —— 這與規格書第 0 節引用的 WorldEdit 官方
-            // 警告（"chests will be empty"）在同一環境下的既有限制一致，不是本次倒退。
-            changes.recordAfter(idx, nmsState, null);
+            recordChange(new BlockPos(position.x(), position.y(), position.z()).asLong(), nmsState);
             return true;
         } catch (Throwable t) {
             fallbackCount.incrementAndGet();
             plugin.getLogger().warning("[WEPoC] WEAsyncExtent 記錄變更失敗，該格 fallback 回原生路徑: " + t);
             return getExtent().setBlock(position, block);
         }
+    }
+
+    /**
+     * 2026-09-15：{@link PasteExecutor} 的「打印機」背景執行緒池版本用——mask 判斷、
+     * transform 座標換算、{@code BukkitAdapter.adapt} 格式轉換這些純計算已經在背景執行緒
+     * 算好了，這裡只需要把算好的最終方塊狀態記進 {@link ChangeBuffer}，不用重跑一次
+     * {@link #setBlock}整套（那樣等於在主執行緒把已經平行算好的工作再做一次）。
+     * 只能在主執行緒呼叫——{@link ChangeBuffer} 本身不是執行緒安全的。
+     */
+    void setPrecomputed(long packedPos, net.minecraft.world.level.block.state.BlockState nmsState) {
+        recordChange(packedPos, nmsState);
+    }
+
+    private void recordChange(long packed, net.minecraft.world.level.block.state.BlockState nmsState) {
+        BlockPos pos = BlockPos.of(packed);
+        int idx = changes.indexOf(packed);
+        if (idx < 0) {
+            net.minecraft.world.level.block.state.BlockState beforeState = level.getBlockState(pos);
+            BlockEntity beforeBe = level.getBlockEntity(pos);
+            CompoundTag beforeNbt = beforeBe != null ? beforeBe.saveWithFullMetadata(level.registryAccess()) : null;
+            idx = changes.recordFirstSeen(packed, beforeState, beforeNbt);
+        }
+
+        // 目前尚未接上 WorldEdit 目標方塊本身攜帶的 NBT 轉換（該轉換正是官方 adapter
+        // 負責的事，此環境沒有能用的 adapter）。落地時若目標方塊需要 block entity，
+        // 只會建立一個乾淨初始化的空白實體 —— 這與規格書第 0 節引用的 WorldEdit 官方
+        // 警告（"chests will be empty"）在同一環境下的既有限制一致，不是本次倒退。
+        changes.recordAfter(idx, nmsState, null);
     }
 }
