@@ -252,6 +252,9 @@ public final class PasteExecutor {
             // 只是我們標記了 customPasteActor，讓它跳過「下一 tick 自動打包」那段
             // （那段假設是原生同步指令，COPY 階段這裡是跨很多 tick 才會完成）。
             WorldEditAsyncPlugin wepoc = (WorldEditAsyncPlugin) plugin;
+            // 見 WorldEditAsyncPlugin#stashPendingSizeHint 註解：這裡已經直接知道精確格數，
+            // 不用像一般指令那樣用估計值，讓 WEAsyncExtent 的 ChangeBuffer 用正確容量建立。
+            wepoc.stashPendingSizeHint(actorId, tier, region.getVolume());
             wepoc.markCustomPasteInFlight(actorId);
             EditSession editSession;
             WEAsyncExtent wrapped;

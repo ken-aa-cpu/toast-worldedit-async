@@ -82,7 +82,17 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
      * 用不到的殘留。加上時間戳記＋TTL，consume 時比對是否過期，並用一個低頻的
      * repeating task 定期清掉沒被消費、放太久的殘留項目。
      */
-    private record PendingTier(SpeedTier tier, long insertedAtMillis) {
+    /**
+     * 2026-09-15：{@code expectedSize} 是這輪追加的——實測發現 {@link WEAsyncExtent} 內部
+     * {@link ChangeBuffer} 用預設容量（4096）起手，大型操作要經歷幾十次「容量翻倍+整批
+     * rehash」才能長到最終大小，這個過程本身的成本遠比想像中高：8,000,000 格 19.2 秒完成，
+     * 但只大 24%（9,938,375 格）就沒能在 60 秒看門狗時限內做完，這種非線性的斷崖式變化
+     * 正是雜湊表反覆擴容的典型癥狀（跟先前 {@link ChangeBuffer} 雜湊碰撞那次踩的坑同一個
+     * 家族的問題，但這次是擴容次數而非碰撞鏈）。反正這個估計值早就為了危險確認閘算過一次
+     * （{@link #estimateOperationVolume}），這裡直接一起帶著走，讓 {@link WEAsyncExtent}
+     * 一開始就用正確的容量建立，不用一路翻倍上去。
+     */
+    private record PendingTier(SpeedTier tier, long insertedAtMillis, long expectedSize) {
     }
 
     private static final long PENDING_TIER_TTL_MILLIS = 5000L;
@@ -137,6 +147,16 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     /** 取出並移除某個 actor 最近一次 {@link #onEditSession} 換上的 {@link WEAsyncExtent}。 */
     WEAsyncExtent takeLastExtent(UUID actor) {
         return lastExtentByActor.remove(actor);
+    }
+
+    /**
+     * {@link PasteExecutor} 自己組出 {@code EditSession} 前呼叫——它已經直接從 clipboard
+     * 的 region 知道精確格數，用同一套 {@link PendingTier} 機制把這個提示帶給
+     * {@link #onEditSession}，讓 //paste 的 {@link WEAsyncExtent} 也用正確容量建立，
+     * 不會跟其他大型操作一樣吃到反覆擴容的成本。
+     */
+    void stashPendingSizeHint(UUID actor, SpeedTier tier, long expectedSize) {
+        pendingTierByActor.put(actor, new PendingTier(tier, System.currentTimeMillis(), expectedSize));
     }
 
     /**
@@ -300,22 +320,23 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             return;
         }
 
+        // 見 PendingTier 欄位註解：這個估計值原本只為了危險確認閘算一次，現在也順便拿來
+        // 當 WEAsyncExtent/ChangeBuffer 的初始容量提示，避免大型操作經歷幾十次擴容+rehash。
+        long estimatedVolume = 0L;
         if (!UNDO_REDO_COMMANDS.contains(cmd)) {
+            estimatedVolume = estimateOperationVolume(player, cmd);
             Long confirmedAtMillis = pendingDangerConfirmByActor.remove(player.getUniqueId());
             boolean dangerConfirmed = confirmedAtMillis != null
                     && System.currentTimeMillis() - confirmedAtMillis <= DANGER_CONFIRM_TTL_MILLIS;
-            if (!dangerConfirmed) {
-                long estimatedVolume = estimateOperationVolume(player, cmd);
-                if (estimatedVolume > DANGER_BLOCK_THRESHOLD) {
-                    event.setCancelled(true);
-                    player.sendMessage(String.format(Locale.ROOT,
-                            "[WEPoC] 這個操作預估會動到約 %,d 格，超過 %,d 格的危險門檻——有很大的風險"
-                                    + "（可能長時間卡住主執行緒，甚至觸發看門狗強制關伺服器）。"
-                                    + "確定要繼續的話，請先輸入 /wepoc danger confirm，緊接著（%d 秒內）"
-                                    + "再送出這個指令一次。",
-                            estimatedVolume, DANGER_BLOCK_THRESHOLD, DANGER_CONFIRM_TTL_MILLIS / 1000));
-                    return;
-                }
+            if (!dangerConfirmed && estimatedVolume > DANGER_BLOCK_THRESHOLD) {
+                event.setCancelled(true);
+                player.sendMessage(String.format(Locale.ROOT,
+                        "[WEPoC] 這個操作預估會動到約 %,d 格，超過 %,d 格的危險門檻——有很大的風險"
+                                + "（可能長時間卡住主執行緒，甚至觸發看門狗強制關伺服器）。"
+                                + "確定要繼續的話，請先輸入 /wepoc danger confirm，緊接著（%d 秒內）"
+                                + "再送出這個指令一次。",
+                        estimatedVolume, DANGER_BLOCK_THRESHOLD, DANGER_CONFIRM_TTL_MILLIS / 1000));
+                return;
             }
         }
 
@@ -366,7 +387,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         // 一般編輯指令：把（可能已剝掉檔位關鍵字的）指令原樣交給 WorldEdit，
         // 檔位另外記著，等這個指令觸發的 EditSessionEvent 進來時才消耗掉一次。
         event.setMessage(String.join(" ", parts));
-        pendingTierByActor.put(player.getUniqueId(), new PendingTier(tier, System.currentTimeMillis()));
+        pendingTierByActor.put(player.getUniqueId(), new PendingTier(tier, System.currentTimeMillis(), estimatedVolume));
     }
 
     /** 見 {@link #pendingTierByActor} 欄位註解：清掉沒被任何 EditSessionEvent 消費、放太久的殘留項目。 */
@@ -457,21 +478,26 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         try {
             org.bukkit.World bukkitWorld = BukkitAdapter.adapt(event.getWorld());
             ServerLevel level = ((CraftWorld) bukkitWorld).getHandle();
-            WEAsyncExtent wrapped = new WEAsyncExtent(event.getExtent(), level, this);
-            event.setExtent(wrapped);
             // 見 SYSTEM_ACTOR_UUID 欄位註解：沒有真人 actor（第三方外掛的無 actor 呼叫）
             // 時頂替一個固定系統假 UUID，讓這類編輯一樣被接管、走分批限流，而不是放給
             // WorldEdit 原生同步路徑直接卡住主執行緒。
             UUID actorId = event.getActor() != null ? event.getActor().getUniqueId() : SYSTEM_ACTOR_UUID;
+            // 用一次就丟：這個 tier/容量提示只給「引發這次 EditSessionEvent 的那個指令」用，
+            // 沒有暫存值（例如指令沒帶檔位參數）時預設 mid、預設容量。remove 而非 get，
+            // 同一筆不會被下一次 EditSessionEvent 重複吃到。
+            PendingTier pending = pendingTierByActor.remove(actorId);
+            boolean pendingFresh = pending != null && System.currentTimeMillis() - pending.insertedAtMillis() <= PENDING_TIER_TTL_MILLIS;
+            SpeedTier tier = pendingFresh ? pending.tier() : SpeedTier.MID;
+            // 見 PendingTier 欄位註解：用預估格數當 ChangeBuffer 初始容量，避免大型操作
+            // 反覆擴容+rehash（實測：不給提示時，一千萬格級別的操作光是這個成本就能讓整個
+            // 操作撐不過看門狗時限，即使已知同尺寸操作在給對容量後遠快於此）。查不到估計值
+            // 或估計值不可信（<=0）時，回退到 WEAsyncExtent 自己的預設值（4096）。
+            long sizeHint = pendingFresh && pending.expectedSize() > 0 ? pending.expectedSize() : 4096;
+            WEAsyncExtent wrapped = new WEAsyncExtent(event.getExtent(), level, this,
+                    (int) Math.min(Integer.MAX_VALUE, sizeHint));
+            event.setExtent(wrapped);
             lastExtentByActor.put(actorId, wrapped);
             String worldKey = level.dimension().location().toString();
-            // 用一次就丟：這個 tier 只給「引發這次 EditSessionEvent 的那個指令」用，
-            // 沒有暫存值（例如指令沒帶檔位參數）時預設 mid。remove 而非 get，同一筆
-            // 不會被下一次 EditSessionEvent 重複吃到。
-            PendingTier pending = pendingTierByActor.remove(actorId);
-            SpeedTier tier = (pending != null && System.currentTimeMillis() - pending.insertedAtMillis() <= PENDING_TIER_TTL_MILLIS)
-                    ? pending.tier()
-                    : SpeedTier.MID;
             // 見 customPasteInFlight 欄位註解：PasteExecutor 自己接管的 //paste 會跨很多
             // tick 才收集完變更，不能套用「下一 tick 就自動打包」這個假設——它會自己在
             // COPY 真正跑完時呼叫 enqueueForward，這裡跳過。
