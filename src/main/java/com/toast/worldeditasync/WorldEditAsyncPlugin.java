@@ -113,6 +113,31 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     private static final long DANGER_CONFIRM_TTL_MILLIS = 30_000L;
     private final Map<UUID, Long> pendingDangerConfirmByActor = new ConcurrentHashMap<>();
     private UndoManager undoManager;
+    private PasteExecutor pasteExecutor;
+
+    /**
+     * 2026-09-15：{@link PasteExecutor} 自己接管 `//paste`，用同一套 {@code EditSessionEvent}
+     * 機制建立 EditSession（見 {@code PasteExecutor#doStart}），會觸發跟原生指令完全一樣的
+     * {@link #onEditSession}——但那裡預設假設「呼叫端是同步指令，下一 tick 前一定已經收集完
+     * 所有變更」，排了一個下一 tick 自動打包丟給 {@link UndoManager#enqueueForward} 的動作。
+     * {@link PasteExecutor} 的 COPY 階段是跨很多 tick 才會做完，不能套用這個假設——用這個集合
+     * 讓 {@link #onEditSession} 對這些 actor 跳過自動打包那一步，改成 {@link PasteExecutor}
+     * 自己在 COPY 真正跑完時才呼叫 {@link UndoManager#enqueueForward}。
+     */
+    private final Set<UUID> customPasteInFlight = ConcurrentHashMap.newKeySet();
+
+    void markCustomPasteInFlight(UUID actor) {
+        customPasteInFlight.add(actor);
+    }
+
+    void clearCustomPasteInFlight(UUID actor) {
+        customPasteInFlight.remove(actor);
+    }
+
+    /** 取出並移除某個 actor 最近一次 {@link #onEditSession} 換上的 {@link WEAsyncExtent}。 */
+    WEAsyncExtent takeLastExtent(UUID actor) {
+        return lastExtentByActor.remove(actor);
+    }
 
     /**
      * 2026-09-15：第三方外掛（例如 BetterStructures 生成大型建築時）呼叫
@@ -138,6 +163,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         getCommand("wepoc").setExecutor(this);
         Bukkit.getPluginManager().registerEvents(this, this);
         undoManager = new UndoManager(this);
+        pasteExecutor = new PasteExecutor(this, undoManager);
         Bukkit.getScheduler().runTaskTimer(this, this::sweepStalePendingTiers, 100L, 100L);
         try {
             WorldEdit.getInstance().getEventBus().register(this);
@@ -323,6 +349,20 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             return;
         }
 
+        // 2026-09-15：//paste 整個接管，理由見 PasteExecutor 類別註解——WorldEdit 原生
+        // Operations.completeLegacy 本身是一次跑完整個區域的同步迴圈，不管我們自己的
+        // WEAsyncExtent/UndoManager 多能分批都救不了它，實測 56.7M 格城堡在 Arclight 上
+        // 兩度觸發看門狗證實了這一點（見驗證報告「二點二十二」）。engine=off 時維持原生路徑
+        // （跟其餘指令的 engine 開關語意一致），且只在玩家真的有官方權限時才接管——沒有權限
+        // 就讓它落回原生路徑，原生自己的權限錯誤訊息會處理，不用我們在這裡重複一套。
+        if (cmd.equals("//paste") && engineEnabled && player.hasPermission("worldedit.clipboard.paste")) {
+            event.setCancelled(true);
+            String[] pasteArgs = Arrays.copyOfRange(parts, 1, parts.length);
+            SpeedTier finalTier = tier;
+            pasteExecutor.handlePasteCommand(player, pasteArgs, finalTier);
+            return;
+        }
+
         // 一般編輯指令：把（可能已剝掉檔位關鍵字的）指令原樣交給 WorldEdit，
         // 檔位另外記著，等這個指令觸發的 EditSessionEvent 進來時才消耗掉一次。
         event.setMessage(String.join(" ", parts));
@@ -432,10 +472,15 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             SpeedTier tier = (pending != null && System.currentTimeMillis() - pending.insertedAtMillis() <= PENDING_TIER_TTL_MILLIS)
                     ? pending.tier()
                     : SpeedTier.MID;
-            Bukkit.getScheduler().runTask(this, () -> {
-                EditRecord record = new EditRecord(actorId, worldKey, wrapped.getChanges());
-                undoManager.enqueueForward(actorId, level, record, tier);
-            });
+            // 見 customPasteInFlight 欄位註解：PasteExecutor 自己接管的 //paste 會跨很多
+            // tick 才收集完變更，不能套用「下一 tick 就自動打包」這個假設——它會自己在
+            // COPY 真正跑完時呼叫 enqueueForward，這裡跳過。
+            if (!customPasteInFlight.contains(actorId)) {
+                Bukkit.getScheduler().runTask(this, () -> {
+                    EditRecord record = new EditRecord(actorId, worldKey, wrapped.getChanges());
+                    undoManager.enqueueForward(actorId, level, record, tier);
+                });
+            }
         } catch (Throwable t) {
             getLogger().severe("[WEPoC] 包裝 extent 失敗，本次編輯將維持原生路徑: " + t);
             t.printStackTrace();

@@ -139,6 +139,27 @@ public final class UndoManager {
     private final Map<UUID, Deque<QueuedAction>> pendingQueues = new ConcurrentHashMap<>();
     private final AutoThrottleController autoThrottle;
     private volatile int maxStackPerPlayer = 15;
+    /**
+     * 2026-09-15：{@link PasteExecutor} 自己接管 `//paste` 之後，COPY 階段（把 clipboard
+     * 內容轉成 {@link ChangeBuffer}）本身也是跨很多 tick 分批完成，完成後才會呼叫
+     * {@link #enqueueForward}——這段期間這裡的 {@code currentJobs} 完全看不到這個玩家有
+     * 工作在跑（因為還沒交過來）。若玩家這時候緊接著送出 //undo，{@link #requestUndo} 會
+     * 立刻把請求排進 {@code pendingQueues}，而 {@link #processPlayer} 原本一看到
+     * {@code currentJobs.get(actor)==null} 就會馬上開始處理它，等於在 COPY 還沒交棒之前
+     * 就把 undo 堆疊最上面那筆（COPY 開始前的最近一筆）復原掉，正向編輯完成的順序就亂了。
+     * 用這個集合讓 {@link PasteExecutor} 標記「這個 actor 現在有一個外部非同步工作正在跑，
+     * 先別開始處理佇列」，COPY 完成、真正呼叫 {@link #enqueueForward} 之後再解除標記
+     * ——跟 {@code currentJobs} 佔位的效果一樣，只是佔位者不在這個類別管理的範圍內。
+     */
+    private final Set<UUID> externallyBusy = ConcurrentHashMap.newKeySet();
+
+    public void markExternallyBusy(UUID actor) {
+        externallyBusy.add(actor);
+    }
+
+    public void clearExternallyBusy(UUID actor) {
+        externallyBusy.remove(actor);
+    }
 
     public UndoManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -238,6 +259,9 @@ public final class UndoManager {
     private void processPlayer(UUID actor) {
         Job job = currentJobs.get(actor);
         if (job == null) {
+            if (externallyBusy.contains(actor)) {
+                return; // 見 externallyBusy 欄位註解：外部非同步工作還沒交棒，佇列先原地等待
+            }
             Deque<QueuedAction> queue = pendingQueues.get(actor);
             if (queue == null || queue.isEmpty()) {
                 return;
