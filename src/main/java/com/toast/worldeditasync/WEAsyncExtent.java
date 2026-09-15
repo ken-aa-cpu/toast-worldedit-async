@@ -114,17 +114,6 @@ public final class WEAsyncExtent extends AbstractDelegateExtent {
         }
     }
 
-    /**
-     * 2026-09-15：{@link PasteExecutor} 的「打印機」背景執行緒池版本用——mask 判斷、
-     * transform 座標換算、{@code BukkitAdapter.adapt} 格式轉換這些純計算已經在背景執行緒
-     * 算好了，這裡只需要把算好的最終方塊狀態記進 {@link ChangeBuffer}，不用重跑一次
-     * {@link #setBlock}整套（那樣等於在主執行緒把已經平行算好的工作再做一次）。
-     * 只能在主執行緒呼叫——{@link ChangeBuffer} 本身不是執行緒安全的。
-     */
-    void setPrecomputed(long packedPos, net.minecraft.world.level.block.state.BlockState nmsState) {
-        recordChange(packedPos, nmsState);
-    }
-
     private void recordChange(long packed, net.minecraft.world.level.block.state.BlockState nmsState) {
         BlockPos pos = BlockPos.of(packed);
         int idx = changes.indexOf(packed);
