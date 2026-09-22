@@ -148,3 +148,9 @@ undo:
 - 「打印機」執行緒池平行化的完整 A/B 對照實驗（含最終判定「沒有實測到加速，拆掉」）
 
 這份文件很長，但如果你想知道「為什麼是這樣設計，不是那樣」，答案幾乎都在裡面。
+
+## License
+
+[GPL-3.0](LICENSE)。這個外掛依賴 WorldEdit（本身是 GPL-3.0）、`//paste` 接管的管線設計
+是反編譯 WorldEdit 原始碼（`ClipboardCommands.paste`/`PasteBuilder`/`ForwardExtentCopy` 等）
+確認邏輯後用它自己公開的類別重組出來的，選用同一份授權條款最不容易有問題。
