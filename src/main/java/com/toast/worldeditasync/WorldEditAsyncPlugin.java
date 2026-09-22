@@ -63,7 +63,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     // >=0 = 我們自己重建成功，值為實際帶有屬性的方塊型別數。
     private static final int PROPERTY_REGISTRY_SKIPPED_OFFICIAL_ADAPTER = -2;
     private volatile int propertyRegistryFixedCount = -1;
-    private volatile boolean engineEnabled = false;
+    private volatile boolean engineEnabled = true;
+    // 2026-09-19：執行期可切換的詳細日誌開關，預設關閉（避免正常運作時洗版）。
+    // 開啟後 debugLog() 才會真的印東西，見 onEditSession/UndoManager/PasteExecutor 裡的呼叫點。
+    private volatile boolean debugEnabled = false;
     // 診斷用暫時開關：僅供重現/排除原生崩潰場景時使用，正常使用不應開啟。
     private final boolean diagnosticAllowNativeUndo = System.getProperty("wepoc.allowNativeUndo") != null;
     // 每個 EditSessionEvent 觸發時新建一個 WEAsyncExtent，用併發表追蹤最近一個實例以便回報統計
@@ -119,8 +122,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     // 約 70 萬格/秒，用預設看門狗時限反推大概 4200 萬格左右就會開始踩線，原本訂的 1 億格
     // 明顯太高——2000 萬格留了足夠安全邊際（且這次測試的城堡屬性複雜度不低，實際門檻
     // 可能因方塊種類更單純而更高，這裡刻意保守）。
-    private static final long DANGER_BLOCK_THRESHOLD = 20_000_000L;
-    private static final long DANGER_CONFIRM_TTL_MILLIS = 30_000L;
+    // 2026-09-19：改成可由 config.yml 的 danger-gate 覆寫的實例欄位，見 onEnable 裡的
+    // loadWepocConfig()；沒有 config.yml 或欄位缺漏時維持這裡寫的預設值，行為不變。
+    private long DANGER_BLOCK_THRESHOLD = 20_000_000L;
+    private long DANGER_CONFIRM_TTL_MILLIS = 30_000L;
     private final Map<UUID, Long> pendingDangerConfirmByActor = new ConcurrentHashMap<>();
     private UndoManager undoManager;
     private PasteExecutor pasteExecutor;
@@ -178,11 +183,50 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
      */
     static final UUID SYSTEM_ACTOR_UUID = new UUID(0L, 0L);
 
+    /**
+     * 2026-09-19：委託人要求的執行期 debug 開關——想排查「某個外掛的呼叫到底有沒有被
+     * 我們攔截到」這類問題時，不用改程式碼重編，直接 {@code /wepoc debug on} 就能看到
+     * 每次 {@link #onEditSession} 觸發的 actor/engine 狀態/選到的檔位，以及
+     * {@link UndoManager}/{@link PasteExecutor} 的 job 階段轉換。預設關閉，正常運作
+     * 不會多印任何東西。
+     */
+    boolean isDebugEnabled() {
+        return debugEnabled;
+    }
+
+    /** 只有 {@link #debugEnabled} 開著才會真的印，統一加 {@code [WEPoC-DEBUG]} 前綴方便篩選 log。 */
+    void debugLog(String message) {
+        if (debugEnabled) {
+            getLogger().info("[WEPoC-DEBUG] " + message);
+        }
+    }
+
+    /**
+     * 2026-09-19：讀取 {@code config.yml}，覆寫危險確認閘的門檻/TTL、三個固定檔位的
+     * 每-tick 預算、引擎預設開關狀態。必須在 {@link #onEnable} 建立
+     * {@link UndoManager}（進而建立 {@link AutoThrottleController}）之前呼叫，因為
+     * {@link SpeedTier#configureBudgets} 之後改值不會回溯套用到已經算好的
+     * {@code AutoThrottleController} 上限快取。
+     */
+    private void loadWepocConfig() {
+        saveDefaultConfig();
+        var cfg = getConfig();
+        engineEnabled = cfg.getBoolean("engine.enabled-by-default", true);
+        DANGER_BLOCK_THRESHOLD = cfg.getLong("danger-gate.block-threshold", 20_000_000L);
+        DANGER_CONFIRM_TTL_MILLIS = cfg.getLong("danger-gate.confirm-ttl-seconds", 30) * 1000L;
+        SpeedTier.configureBudgets(
+                cfg.getLong("speed-tiers.slow-budget-ms", 2) * 1_000_000L,
+                cfg.getLong("speed-tiers.mid-budget-ms", 6) * 1_000_000L,
+                cfg.getLong("speed-tiers.fast-budget-ms", 15) * 1_000_000L);
+    }
+
     @Override
     public void onEnable() {
+        loadWepocConfig();
         getCommand("wepoc").setExecutor(this);
         Bukkit.getPluginManager().registerEvents(this, this);
         undoManager = new UndoManager(this);
+        undoManager.setMaxStackPerPlayer(getConfig().getInt("undo.max-stack-per-player", 15));
         pasteExecutor = new PasteExecutor(this, undoManager);
         Bukkit.getScheduler().runTaskTimer(this, this::sweepStalePendingTiers, 100L, 100L);
         try {
@@ -467,8 +511,9 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     // UndoManager 排隊，用限時分批流程落地——forward/undo/redo 三者共用同一套排程與寫入路徑。
     @Subscribe
     public void onEditSession(EditSessionEvent event) {
-        getLogger().info("[WEPoC] EditSessionEvent 觸發: actor=" + event.getActor()
-                + " world=" + event.getWorld() + " stage=" + event.getStage());
+        debugLog("EditSessionEvent 觸發: actor=" + event.getActor()
+                + " world=" + event.getWorld() + " stage=" + event.getStage()
+                + " engine=" + (engineEnabled ? "on" : "off"));
         if (!engineEnabled) {
             return;
         }
@@ -482,6 +527,10 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             // 時頂替一個固定系統假 UUID，讓這類編輯一樣被接管、走分批限流，而不是放給
             // WorldEdit 原生同步路徑直接卡住主執行緒。
             UUID actorId = event.getActor() != null ? event.getActor().getUniqueId() : SYSTEM_ACTOR_UUID;
+            if (event.getActor() == null) {
+                debugLog("actor=null（第三方外掛未帶 actor 呼叫 WorldEdit），改用系統假 UUID="
+                        + SYSTEM_ACTOR_UUID + " 接管此次編輯");
+            }
             // 用一次就丟：這個 tier/容量提示只給「引發這次 EditSessionEvent 的那個指令」用，
             // 沒有暫存值（例如指令沒帶檔位參數）時預設 mid、預設容量。remove 而非 get，
             // 同一筆不會被下一次 EditSessionEvent 重複吃到。
@@ -498,6 +547,8 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             event.setExtent(wrapped);
             lastExtentByActor.put(actorId, wrapped);
             String worldKey = level.dimension().location().toString();
+            debugLog("接管完成: actor=" + actorId + " tier=" + tier + " sizeHint=" + sizeHint
+                    + " customPasteInFlight=" + customPasteInFlight.contains(actorId));
             // 見 customPasteInFlight 欄位註解：PasteExecutor 自己接管的 //paste 會跨很多
             // tick 才收集完變更，不能套用「下一 tick 就自動打包」這個假設——它會自己在
             // COPY 真正跑完時呼叫 enqueueForward，這裡跳過。
@@ -516,10 +567,12 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
+            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|debug|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
+            case "debug":
+                return handleDebug(sender, args);
             case "hookstatus":
                 sender.sendMessage("[WEPoC] EditSessionEvent 已註冊: " + editSessionHookRegistered
                         + " BukkitImplAdapter 已註冊: " + adapterRegistered
@@ -559,9 +612,20 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             case "relightverify":
                 return handleRelightVerify(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
+                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|debug|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
                 return true;
         }
+    }
+
+    private boolean handleDebug(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage("用法: /wepoc debug <on|off>，目前=" + (debugEnabled ? "on" : "off"));
+            return true;
+        }
+        debugEnabled = args[1].equalsIgnoreCase("on");
+        sender.sendMessage("[WEPoC] debug 設為 " + (debugEnabled ? "on" : "off"));
+        getLogger().info("[WEPoC] debug 設為 " + (debugEnabled ? "on" : "off"));
+        return true;
     }
 
     // 比對兩個等大區域（A 與 A 平移 (ox,oy,oz) 後的 B）的光照值，分別回報「區域內部」與

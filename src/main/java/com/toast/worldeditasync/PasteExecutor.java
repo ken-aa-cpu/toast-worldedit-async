@@ -31,7 +31,6 @@ import net.minecraft.server.level.ServerLevel;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.v1_21_R1.CraftWorld;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -128,12 +127,12 @@ public final class PasteExecutor {
         }
     }
 
-    private final JavaPlugin plugin;
+    private final WorldEditAsyncPlugin plugin;
     private final UndoManager undoManager;
     private final Map<UUID, Job> currentJobs = new ConcurrentHashMap<>();
     private final Map<UUID, Deque<Runnable>> pendingStarts = new ConcurrentHashMap<>();
 
-    public PasteExecutor(JavaPlugin plugin, UndoManager undoManager) {
+    public PasteExecutor(WorldEditAsyncPlugin plugin, UndoManager undoManager) {
         this.plugin = plugin;
         this.undoManager = undoManager;
         Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 1L, 1L);
@@ -263,18 +262,17 @@ public final class PasteExecutor {
             // WorldEditAsyncPlugin#onEditSession 照常把 WEAsyncExtent 換上去，
             // 只是我們標記了 customPasteActor，讓它跳過「下一 tick 自動打包」那段
             // （那段假設是原生同步指令，COPY 階段這裡是跨很多 tick 才會完成）。
-            WorldEditAsyncPlugin wepoc = (WorldEditAsyncPlugin) plugin;
             // 見 WorldEditAsyncPlugin#stashPendingSizeHint 註解：這裡已經直接知道精確格數，
             // 不用像一般指令那樣用估計值，讓 WEAsyncExtent 的 ChangeBuffer 用正確容量建立。
-            wepoc.stashPendingSizeHint(actorId, tier, region.getVolume());
-            wepoc.markCustomPasteInFlight(actorId);
+            plugin.stashPendingSizeHint(actorId, tier, region.getVolume());
+            plugin.markCustomPasteInFlight(actorId);
             EditSession editSession;
             WEAsyncExtent wrapped;
             try {
                 editSession = session.createEditSession(weActor);
-                wrapped = wepoc.takeLastExtent(actorId);
+                wrapped = plugin.takeLastExtent(actorId);
             } finally {
-                wepoc.clearCustomPasteInFlight(actorId);
+                plugin.clearCustomPasteInFlight(actorId);
             }
             if (wrapped == null) {
                 player.sendMessage("[WEPoC] //paste 失敗：引擎沒有接管到這次的 EditSession（engine 是否開啟？）");
@@ -293,6 +291,9 @@ public final class PasteExecutor {
             currentJobs.put(actorId, job);
             player.sendMessage(String.format(Locale.ROOT,
                     "[WEPoC] //paste 已接管，開始背景分批複製（%,d 格來源方塊）...", job.blockTotal));
+            plugin.debugLog("PasteExecutor job 開始: actor=" + actorId + " tier=" + tier
+                    + " 來源格數=" + job.blockTotal + " copyEntities=" + job.copyEntities
+                    + " copyBiomes=" + job.copyBiomes);
 
             if (flags.selectPasted()) {
                 // 選取更新本身量體極小（只是設定 CuboidRegionSelector），維持同步，跟原生一致。
@@ -401,6 +402,8 @@ public final class PasteExecutor {
 
     /** 方塊迭代跑完之後：entity/biome（若有要求）一次性同步跑完，然後交棒給 UndoManager。 */
     private void finishJob(UUID actor, Job job) {
+        plugin.debugLog("PasteExecutor job COPY 完成: actor=" + actor + " 格數=" + job.blockTotal
+                + "，交棒給 UndoManager 進入 WRITE/RELIGHT");
         try {
             if (job.copyBiomes) {
                 ExtentBiomeCopy biomeCopy = new ExtentBiomeCopy(job.transformedSource, job.from, job.editSession, job.to, job.transform);

@@ -17,7 +17,6 @@ import com.toast.worldeditasync.light.RustLightEngine;
 import org.bukkit.Bukkit;
 import org.bukkit.craftbukkit.v1_21_R1.CraftServer;
 import org.bukkit.entity.Player;
-import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayDeque;
 import java.util.Collections;
@@ -132,7 +131,7 @@ public final class UndoManager {
      */
     private static final long RUST_RELIGHT_TIMEOUT_MILLIS = 20_000L;
 
-    private final JavaPlugin plugin;
+    private final WorldEditAsyncPlugin plugin;
     private final Map<UUID, Deque<EditRecord>> undoStacks = new ConcurrentHashMap<>();
     private final Map<UUID, Deque<EditRecord>> redoStacks = new ConcurrentHashMap<>();
     private final Map<UUID, Job> currentJobs = new ConcurrentHashMap<>();
@@ -161,7 +160,7 @@ public final class UndoManager {
         externallyBusy.remove(actor);
     }
 
-    public UndoManager(JavaPlugin plugin) {
+    public UndoManager(WorldEditAsyncPlugin plugin) {
         this.plugin = plugin;
         this.autoThrottle = new AutoThrottleController(plugin.getLogger());
         Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 1L, 1L);
@@ -272,6 +271,8 @@ public final class UndoManager {
                 return;
             }
             currentJobs.put(actor, job);
+            plugin.debugLog("job 開始: actor=" + actor + " type=" + job.type + " tier=" + job.tier
+                    + " 格數=" + job.record.changes.size());
         }
 
         long budgetNanos = switch (job.tier) {
@@ -321,12 +322,14 @@ public final class UndoManager {
             if (!yielded) {
                 dispatchRustCompute(job);
                 job.phase = Phase.RELIGHT_WAIT;
+                plugin.debugLog("GATHER 完成，已丟給 Rust 背景執行緒，進入 RELIGHT_WAIT");
             }
         }
 
         if (!yielded && job.phase == Phase.RELIGHT_WAIT) {
             if (job.rustDone) {
                 if (job.rustSucceeded) {
+                    plugin.debugLog("Rust 光罩計算完成，進入 RELIGHT_APPLY");
                     beginRelightApply(job);
                 } else {
                     plugin.getLogger().warning("[WEPoC] 光罩計算池這批失敗，fallback 回逐格 checkBlock");
@@ -373,6 +376,7 @@ public final class UndoManager {
             job.phase = Phase.RELIGHT;
             job.relightIterator = Collections.emptyIterator();
             job.relightTotal = 0;
+            plugin.debugLog("WRITE 完成，無變更需要 relight");
             return;
         }
         int[] box = computeRelightBox(touched);
@@ -383,8 +387,11 @@ public final class UndoManager {
             job.phase = Phase.RELIGHT;
             job.relightIterator = new BoxIterator(box[0], box[1], box[2], box[3], box[4], box[5]);
             job.relightTotal = (int) volume;
+            plugin.debugLog("WRITE 完成，進入 RELIGHT（逐格 checkBlock）: box體積=" + volume
+                    + "（未達 Rust 派工門檻或計算池不可用）");
             return;
         }
+        plugin.debugLog("WRITE 完成，進入 RELIGHT_GATHER（Rust 光罩計算池）: box體積=" + volume);
         job.rlMinX = box[0];
         job.rlMinY = box[1];
         job.rlMinZ = box[2];
@@ -716,6 +723,8 @@ public final class UndoManager {
     }
 
     private void finishJob(UUID actor, Job job) {
+        plugin.debugLog("job 完成: actor=" + actor + " type=" + job.type
+                + " 格數=" + job.record.changes.size());
         switch (job.type) {
             case FORWARD -> {
                 pushCapped(undoStacks, actor, job.record);

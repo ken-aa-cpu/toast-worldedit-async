@@ -27,14 +27,15 @@ WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執�
 
 ## 開始使用
 
-引擎預設是關的，開伺服器後要手動開：
+引擎預設是開的（可在 `config.yml` 的 `engine.enabled-by-default` 改成 `false`），開服後
+不用再手動下指令。要臨時關掉比對/退回原生行為，隨時可以：
 
 ```
-/wepoc engine on
+/wepoc engine off
 ```
 
-`engine=off` 時，所有 WorldEdit 指令都走原生路徑，跟沒裝這個外掛完全一樣（方便隨時
-比對/退回）。`engine=on` 之後：
+`engine=off` 時，所有 WorldEdit 指令都走原生路徑，跟沒裝這個外掛完全一樣。`engine=on`
+（預設狀態）之後：
 
 - `//set`、`//replace` 等大範圍編輯指令的**寫入**跟**光照重算**會被接管，跨 tick 分批
 - `//paste` 整個指令被接管，改成我們自己跨 tick 分批驅動（見下方「為什麼 `//paste` 要
@@ -73,6 +74,29 @@ WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執�
 
 再送出原本那個指令一次即可放行（只放行一次，不會一直記著）。
 
+## 設定檔（config.yml）
+
+`plugins/Toast_WorldEditAsync/config.yml`（第一次啟動會自動產生預設值）：
+
+```yaml
+engine:
+  enabled-by-default: true   # 開服時引擎是否自動開啟
+
+danger-gate:
+  block-threshold: 20000000  # 危險確認閘的門檻（格數）
+  confirm-ttl-seconds: 30    # /wepoc danger confirm 後的有效時間
+
+speed-tiers:
+  slow-budget-ms: 2
+  mid-budget-ms: 6
+  fast-budget-ms: 15
+
+undo:
+  max-stack-per-player: 15   # 每位玩家 undo/redo 堆疊上限（執行期仍可用 /wepoc maxundo 覆寫）
+```
+
+改完要重啟伺服器才會生效，目前沒有 `/wepoc reload` 這種執行期重載指令。
+
 ## 常用指令一覽
 
 | 指令 | 說明 |
@@ -83,6 +107,7 @@ WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執�
 | `/wepoc mspt` | 看伺服器目前的真實 MSPT（平均/最近一筆） |
 | `/wepoc maxundo <n>` | 設定每位玩家 undo/redo 堆疊上限（預設 15） |
 | `/wepoc hookstatus` | 檢查 EditSessionEvent 訂閱、BukkitImplAdapter 是否正常註冊 |
+| `/wepoc debug <on\|off>` | 切換詳細日誌（`[WEPoC-DEBUG]` 前綴），排查「某個外掛的呼叫有沒有被接管到」這類問題時開 |
 
 ## 已知限制
 
@@ -96,17 +121,20 @@ WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執�
    但不是用 Arclight 的真實吞吐量算出來的精確值。
 3. **`//paste` 的 entity/biome 複製（`-e`/`-b`）仍是同步一次跑完**，沒有跨 tick 分批
    保護。一般情況下這兩者的數量遠小於方塊數，但沒有實測驗證極端案例。
-4. **沒有 config.yml**，門檻、上限這些數字目前寫死在程式碼常數裡。
-5. **沒有測過多人同時進行大範圍操作的併發情境。**
-6. **WorldEdit 的官方剪貼簿（`//copy`/`//schem load` 用的）本身沒有優化**——大型結構
+4. **沒有測過多人同時進行大範圍操作的併發情境。**
+5. **WorldEdit 的官方剪貼簿（`//copy`/`//schem load` 用的）本身沒有優化**——大型結構
    複製到剪貼簿仍然吃掉可觀記憶體（Java 物件陣列），這個外掛只優化了「怎麼把剪貼簿內容
    寫進世界」，沒有動剪貼簿儲存本身。
-7. **仍是 PoC 等級**：程式碼裡留著不少開發過程用的診斷指令（`rustlighttest`、
+6. **仍是 PoC 等級**：程式碼裡留著不少開發過程用的診斷指令（`rustlighttest`、
    `lightwritetest`、`relightverify`、`noactortest`、`blockdiff`、`lightdiff`、
    `propdump` 等），正式營運前應該考慮加權限保護或移除。
-8. **只驗證過 Arclight 1.21.1+ WorldEdit 7.3.7 這個確切版本組合**——內部用到不少該版本
+7. **只驗證過 Arclight 1.21.1+ WorldEdit 7.3.7 這個確切版本組合**——內部用到不少該版本
    的反射/內部類別細節，版本升級後這些反射點大概率會失效（啟動時 `hookstatus` 會明確
    報告失敗，不會靜默壞掉）。
+8. **`config.yml` 的值只在啟動時讀一次**，沒有執行期重載指令，改完設定檔要重啟伺服器。
+9. **undo/redo 堆疊、`/wepoc stats` 統計數字都只存在記憶體裡**，伺服器重啟就會歸零，
+   沒有落地成檔案或資料庫，也沒有操作稽核紀錄——`logs/latest.log` 有印出關鍵事件，
+   但那是 vanilla 自己的日誌機制，不是本引擎專門管理的紀錄。
 
 ## 給想深入的人：完整工程紀錄
 

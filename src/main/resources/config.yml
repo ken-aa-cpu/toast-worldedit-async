@@ -1,0 +1,28 @@
+# Toast_WorldEditAsync 設定檔
+# 改完這裡的值要重啟伺服器才會生效（目前沒有 /wepoc reload 這種執行期重載指令）。
+
+engine:
+  # 伺服器啟動時引擎是否自動開啟。開了以後仍可用 /wepoc engine off 隨時關掉。
+  enabled-by-default: true
+
+danger-gate:
+  # 預估會動到超過這個格數的操作（//paste 看剪貼簿體積、其餘看目前選區體積），
+  # 會先被擋下來，要求打 /wepoc danger confirm 才放行。這個數字是用 Paper 環境
+  # 實測吞吐量（約 70 萬格/秒）反推 60 秒看門狗大約 4200 萬格會踩線後，抓一半留
+  # 安全邊際訂出來的，還沒針對 Arclight 重新校準，改動前請參考 驗證報告.md。
+  block-threshold: 20000000
+  # /wepoc danger confirm 之後，下一個 WorldEdit 指令要在幾秒內送出才算數，
+  # 逾時或送出其他非操作指令都會讓這次確認失效。
+  confirm-ttl-seconds: 30
+
+speed-tiers:
+  # 三個固定檔位每 tick 願意花的時間（毫秒）。auto 檔位不看這幾個值，
+  # 它會動態量測真實 tick 耗時自行調整，但 auto 的預算上限就是 fast 這個值。
+  slow-budget-ms: 2
+  mid-budget-ms: 6
+  fast-budget-ms: 15
+
+undo:
+  # 每位玩家 undo/redo 堆疊的預設上限，伺服器執行期仍可用 /wepoc maxundo 覆寫，
+  # 但重啟後會回到這個值。
+  max-stack-per-player: 15
