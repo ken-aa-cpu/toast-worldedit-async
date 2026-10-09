@@ -22,7 +22,7 @@ WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執�
 ./gradlew.bat build
 ```
 
-輸出的 jar 在 `build/libs/Toast_WorldEditAsync-0.1.0.jar`，放進 `plugins/` 資料夾即可
+輸出的 jar 在 `build/libs/Toast_WorldEditAsync-0.2.0.jar`，放進 `plugins/` 資料夾即可
 （跟 WorldEdit 一起裝，`plugin.yml` 宣告了 `depend: [WorldEdit]`）。
 
 ## 開始使用
