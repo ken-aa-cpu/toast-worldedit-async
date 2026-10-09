@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.toast.worldeditasync"
-version = "0.2.0"
+version = "0.2.0-lazy"
 
 repositories {
     mavenCentral()

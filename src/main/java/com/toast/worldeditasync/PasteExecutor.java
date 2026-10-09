@@ -191,7 +191,7 @@ public final class PasteExecutor {
         Runnable start = () -> doStart(player, args, tier);
         if (currentJobs.containsKey(actorId)) {
             pendingStarts.computeIfAbsent(actorId, k -> new ArrayDeque<>()).addLast(start);
-            player.sendMessage("[WEPoC] 上一個 //paste 還在背景處理中，這次已排隊，會照順序接著跑。");
+            plugin.sendActionBar(player, "[WEPoC] 上一個 //paste 還在背景處理中，這次已排隊，會照順序接著跑。");
             return;
         }
         start.run();
@@ -208,7 +208,7 @@ public final class PasteExecutor {
             try {
                 holder = session.getClipboard();
             } catch (Throwable t) {
-                player.sendMessage("Your clipboard is empty. Use //copy first.");
+                plugin.sendActionBar(player, "Your clipboard is empty. Use //copy first.");
                 return;
             }
             Clipboard clipboard = holder.getClipboard();
@@ -220,7 +220,7 @@ public final class PasteExecutor {
             try {
                 to = flags.atOrigin() ? clipboard.getOrigin() : session.getPlacementPosition(weActor);
             } catch (Throwable t) {
-                player.sendMessage("[WEPoC] //paste 失敗：" + t.getMessage());
+                plugin.sendActionBar(player, "[WEPoC] //paste 失敗：" + t.getMessage());
                 return;
             }
 
@@ -251,7 +251,7 @@ public final class PasteExecutor {
                     Mask userMask = WorldEdit.getInstance().getMaskFactory().parseFromInput(flags.maskInput(), parserContext);
                     combinedMask = combinedMask == Masks.alwaysTrue() ? userMask : new MaskIntersection(combinedMask, userMask);
                 } catch (Throwable t) {
-                    player.sendMessage("[WEPoC] //paste 的 -m 遮罩解析失敗，已忽略: " + t.getMessage());
+                    plugin.sendActionBar(player, "[WEPoC] //paste 的 -m 遮罩解析失敗，已忽略: " + t.getMessage());
                 }
             }
 
@@ -275,7 +275,7 @@ public final class PasteExecutor {
                 plugin.clearCustomPasteInFlight(actorId);
             }
             if (wrapped == null) {
-                player.sendMessage("[WEPoC] //paste 失敗：引擎沒有接管到這次的 EditSession（engine 是否開啟？）");
+                plugin.sendActionBar(player, "[WEPoC] //paste 失敗：引擎沒有接管到這次的 EditSession（engine 是否開啟？）");
                 editSession.close();
                 return;
             }
@@ -289,7 +289,7 @@ public final class PasteExecutor {
                     flags.pasteEntities(), flags.pasteBiomes() && clipboard.hasBiomes(),
                     transformedSource, region, clipboard.getOrigin(), to, transform);
             currentJobs.put(actorId, job);
-            player.sendMessage(String.format(Locale.ROOT,
+            plugin.sendActionBar(player, String.format(Locale.ROOT,
                     "[WEPoC] //paste 已接管，開始背景分批複製（%,d 格來源方塊）...", job.blockTotal));
             plugin.debugLog("PasteExecutor job 開始: actor=" + actorId + " tier=" + tier
                     + " 來源格數=" + job.blockTotal + " copyEntities=" + job.copyEntities
@@ -300,7 +300,7 @@ public final class PasteExecutor {
                 applyPasteSelection(player, weWorld, session, holder, clipboard, region, to);
             }
         } catch (Throwable t) {
-            player.sendMessage("[WEPoC] //paste 發生未預期例外: " + t);
+            plugin.sendActionBar(player, "[WEPoC] //paste 發生未預期例外: " + t);
             plugin.getLogger().severe("[WEPoC] PasteExecutor.doStart 例外: " + t);
             t.printStackTrace();
         }
@@ -309,7 +309,7 @@ public final class PasteExecutor {
     private void applySelectionOnly(Player player, com.sk89q.worldedit.world.World weWorld, LocalSession session,
             ClipboardHolder holder, Clipboard clipboard, Region region, BlockVector3 to) {
         applyPasteSelection(player, weWorld, session, holder, clipboard, region, to);
-        player.sendMessage("已選取，未貼上。");
+        plugin.sendActionBar(player, "已選取，未貼上。");
     }
 
     /** 照抄原生 {@code ClipboardCommands.paste} 的選取更新邏輯，量體小，同步處理無風險。 */
@@ -446,7 +446,7 @@ public final class PasteExecutor {
 
             Player player = Bukkit.getPlayer(actor);
             if (player != null) {
-                player.sendMessage(String.format(Locale.ROOT,
+                plugin.sendActionBar(player, String.format(Locale.ROOT,
                         "[WEPoC] //paste 複製完成（%,d 格），已交給引擎排隊落地。", job.blockDone));
             }
 

@@ -756,7 +756,7 @@ public final class UndoManager {
     private void notifyPlayer(UUID actor, String msg) {
         Player p = Bukkit.getPlayer(actor);
         if (p != null) {
-            p.sendMessage(msg);
+            plugin.sendActionBar(p, msg);
         }
         plugin.getLogger().info("[WEPoC] (" + actor + ") " + msg);
     }

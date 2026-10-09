@@ -1,5 +1,13 @@
 # Toast_WorldEditAsync
 
+> **這是「懶人版」（`lazy` 分支）**：跟完整版（`master` 分支）的差別——
+> - 檔位一律 `auto`，不需要（也不會理會）指令尾端的 `slow/mid/fast/auto`
+> - 訊息一律顯示在 actionbar，不洗聊天欄
+> - 只留會取代原版行為的部分（`//paste` 接管、`//undo`/`//redo` 接管、寫入/光照接管）；診斷用的 `/wepoc` 子指令全部移除，只剩 `/wepoc danger confirm`（危險確認閘需要）與 `/wepoc debug on|off`
+> - 引擎預設開啟，沒有 `/wepoc engine` 開關（要停用請改 `config.yml` 的 `engine.enabled-by-default` 後重啟）
+> - 完整版（含所有診斷指令、固定檔位）請看 `master` 分支與 Releases 的 `v0.2.0`
+
+
 Arclight（Forge/NeoForge + Bukkit 混合伺服器）上的 WorldEdit 非同步方塊引擎 PoC。
 
 WorldEdit 原生的大範圍操作（`//paste`、`//set` 等）會在呼叫執行緒上一次同步跑完整個

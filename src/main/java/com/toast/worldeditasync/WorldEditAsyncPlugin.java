@@ -194,6 +194,32 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
         return debugEnabled;
     }
 
+    /** 懶人版：所有給玩家的訊息改走 actionbar，避免洗版聊天欄。非玩家（console）仍用一般訊息。 */
+    void sendActionBar(CommandSender target, String message) {
+        if (target instanceof Player p) {
+            p.spigot().sendMessage(net.md_5.bungee.api.ChatMessageType.ACTION_BAR,
+                    new net.md_5.bungee.api.chat.TextComponent(message));
+        } else {
+            target.sendMessage(message);
+        }
+    }
+
+    /** actionbar 約 2~3 秒就淡出；重要訊息（例如危險門檻警告）每 2 秒重送一次、持續 {@code seconds} 秒。 */
+    void sendActionBarFor(Player player, String message, int seconds) {
+        sendActionBar(player, message);
+        int[] remaining = {Math.max(0, seconds / 2)};
+        if (remaining[0] == 0) {
+            return;
+        }
+        Bukkit.getScheduler().runTaskTimer(this, task -> {
+            if (!player.isOnline() || remaining[0]-- <= 0) {
+                task.cancel();
+                return;
+            }
+            sendActionBar(player, message);
+        }, 40L, 40L);
+    }
+
     /** 只有 {@link #debugEnabled} 開著才會真的印，統一加 {@code [WEPoC-DEBUG]} 前綴方便篩選 log。 */
     void debugLog(String message) {
         if (debugEnabled) {
@@ -374,19 +400,17 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
                     && System.currentTimeMillis() - confirmedAtMillis <= DANGER_CONFIRM_TTL_MILLIS;
             if (!dangerConfirmed && estimatedVolume > DANGER_BLOCK_THRESHOLD) {
                 event.setCancelled(true);
-                player.sendMessage(String.format(Locale.ROOT,
-                        "[WEPoC] 這個操作預估會動到約 %,d 格，超過 %,d 格的危險門檻——有很大的風險"
-                                + "（可能長時間卡住主執行緒，甚至觸發看門狗強制關伺服器）。"
-                                + "確定要繼續的話，請先輸入 /wepoc danger confirm，緊接著（%d 秒內）"
-                                + "再送出這個指令一次。",
-                        estimatedVolume, DANGER_BLOCK_THRESHOLD, DANGER_CONFIRM_TTL_MILLIS / 1000));
+                sendActionBarFor(player, String.format(Locale.ROOT,
+                        "[WEPoC] 預估動到約 %,d 格，超過 %,d 格危險門檻。確定要做請先輸入 /wepoc danger confirm，"
+                                + "%d 秒內再送出一次指令",
+                        estimatedVolume, DANGER_BLOCK_THRESHOLD, DANGER_CONFIRM_TTL_MILLIS / 1000), 8);
                 return;
             }
         }
 
-        SpeedTier tier = SpeedTier.MID;
+        // 懶人版：檔位一律 auto。指令尾端的 slow/mid/fast/auto 仍會被剝掉（相容舊習慣），但不再生效。
+        SpeedTier tier = SpeedTier.AUTO;
         if (parts.length > 1 && isTierKeyword(parts[parts.length - 1])) {
-            tier = SpeedTier.parse(parts[parts.length - 1]);
             parts = Arrays.copyOf(parts, parts.length - 1);
         }
 
@@ -536,7 +560,7 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
             // 同一筆不會被下一次 EditSessionEvent 重複吃到。
             PendingTier pending = pendingTierByActor.remove(actorId);
             boolean pendingFresh = pending != null && System.currentTimeMillis() - pending.insertedAtMillis() <= PENDING_TIER_TTL_MILLIS;
-            SpeedTier tier = pendingFresh ? pending.tier() : SpeedTier.MID;
+            SpeedTier tier = pendingFresh ? pending.tier() : SpeedTier.AUTO;
             // 見 PendingTier 欄位註解：用預估格數當 ChangeBuffer 初始容量，避免大型操作
             // 反覆擴容+rehash（實測：不給提示時，一千萬格級別的操作光是這個成本就能讓整個
             // 操作撐不過看門狗時限，即使已知同尺寸操作在給對容量後遠快於此）。查不到估計值
@@ -567,738 +591,48 @@ public final class WorldEditAsyncPlugin extends JavaPlugin implements CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|debug|stats|maxundo|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
+            sendActionBar(sender, "用法: /wepoc <debug|danger> [args]");
             return true;
         }
         switch (args[0].toLowerCase()) {
             case "debug":
                 return handleDebug(sender, args);
-            case "hookstatus":
-                sender.sendMessage("[WEPoC] EditSessionEvent 已註冊: " + editSessionHookRegistered
-                        + " BukkitImplAdapter 已註冊: " + adapterRegistered
-                        + " property registry 重建: " + (propertyRegistryFixedCount == PROPERTY_REGISTRY_SKIPPED_OFFICIAL_ADAPTER
-                                ? "不需要（官方 adapter 已存在）"
-                                : propertyRegistryFixedCount < 0
-                                        ? "失敗（見啟動 log，屬性語法/copy-paste 屬性保留已回歸遺失狀態）"
-                                        : (propertyRegistryFixedCount + " 個型別帶屬性"))
-                        + " engine=" + (engineEnabled ? "on" : "off"));
-                return true;
-            case "mspt":
-                return handleMspt(sender);
-            case "write":
-                return handleWrite(sender, args);
-            case "engine":
-                return handleEngine(sender, args);
-            case "stats":
-                return handleStats(sender);
-            case "maxundo":
-                return handleMaxUndo(sender, args);
-            case "verify":
-                return handleVerify(sender, args);
-            case "lightdiff":
-                return handleLightDiff(sender, args);
-            case "blockdiff":
-                return handleBlockDiff(sender, args);
-            case "propdump":
-                return handlePropDump(sender, args);
             case "danger":
                 return handleDangerConfirm(sender, args);
-            case "noactortest":
-                return handleNoActorTest(sender, args);
-            case "rustlighttest":
-                return handleRustLightTest(sender, args);
-            case "lightwritetest":
-                return handleLightWriteTest(sender, args);
-            case "relightverify":
-                return handleRelightVerify(sender, args);
             default:
-                sender.sendMessage("用法: /wepoc <write|mspt|hookstatus|engine|debug|stats|maxundo|verify|lightdiff|blockdiff|danger|noactortest|rustlighttest|lightwritetest|relightverify> [args]");
+                sendActionBar(sender, "用法: /wepoc <debug|danger> [args]");
                 return true;
         }
     }
 
     private boolean handleDebug(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sender.sendMessage("用法: /wepoc debug <on|off>，目前=" + (debugEnabled ? "on" : "off"));
+            sendActionBar(sender, "用法: /wepoc debug <on|off>，目前=" + (debugEnabled ? "on" : "off"));
             return true;
         }
         debugEnabled = args[1].equalsIgnoreCase("on");
-        sender.sendMessage("[WEPoC] debug 設為 " + (debugEnabled ? "on" : "off"));
+        sendActionBar(sender, "[WEPoC] debug 設為 " + (debugEnabled ? "on" : "off"));
         getLogger().info("[WEPoC] debug 設為 " + (debugEnabled ? "on" : "off"));
-        return true;
-    }
-
-    // 比對兩個等大區域（A 與 A 平移 (ox,oy,oz) 後的 B）的光照值，分別回報「區域內部」與
-    // 「區域外擴 buffer 圈（可能被波及但沒被直接寫入）」的相符/不相符數量，並列出前幾筆不符範例。
-    // /wepoc lightdiff x1 y1 z1 x2 y2 z2 ox oy oz [buffer]
-    private boolean handleLightDiff(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player) || args.length < 10) {
-            sender.sendMessage("用法: /wepoc lightdiff x1 y1 z1 x2 y2 z2 ox oy oz [buffer=2]");
-            return true;
-        }
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            int ox = Integer.parseInt(args[7]), oy = Integer.parseInt(args[8]), oz = Integer.parseInt(args[9]);
-            int buffer = args.length >= 11 ? Integer.parseInt(args[10]) : 2;
-
-            ServerLevel level = ((CraftWorld) ((Player) sender).getWorld()).getHandle();
-            int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
-            int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
-            int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
-
-            int interiorTotal = 0, interiorMismatch = 0, bufferTotal = 0, bufferMismatch = 0;
-            List<String> interiorExamples = new ArrayList<>();
-            List<String> bufferExamples = new ArrayList<>();
-
-            for (int x = minX - buffer; x <= maxX + buffer; x++) {
-                for (int y = minY - buffer; y <= maxY + buffer; y++) {
-                    for (int z = minZ - buffer; z <= maxZ + buffer; z++) {
-                        boolean interior = x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ;
-                        BlockPos posA = new BlockPos(x, y, z);
-                        BlockPos posB = new BlockPos(x + ox, y + oy, z + oz);
-                        int skyA = level.getLightEngine().getLayerListener(LightLayer.SKY).getLightValue(posA);
-                        int skyB = level.getLightEngine().getLayerListener(LightLayer.SKY).getLightValue(posB);
-                        int blockA = level.getLightEngine().getLayerListener(LightLayer.BLOCK).getLightValue(posA);
-                        int blockB = level.getLightEngine().getLayerListener(LightLayer.BLOCK).getLightValue(posB);
-                        boolean mismatch = skyA != skyB || blockA != blockB;
-                        if (interior) {
-                            interiorTotal++;
-                            if (mismatch) {
-                                interiorMismatch++;
-                                if (interiorExamples.size() < 5) {
-                                    interiorExamples.add(String.format("內部 pos=(%d,%d,%d) sky=%d/%d block=%d/%d",
-                                            x, y, z, skyA, skyB, blockA, blockB));
-                                }
-                            }
-                        } else {
-                            bufferTotal++;
-                            if (mismatch) {
-                                bufferMismatch++;
-                                if (bufferExamples.size() < 5) {
-                                    bufferExamples.add(String.format("緩衝圈 pos=(%d,%d,%d) sky=%d/%d block=%d/%d",
-                                            x, y, z, skyA, skyB, blockA, blockB));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            sender.sendMessage(String.format("[WEPoC] lightdiff 內部=%d/%d不符 緩衝圈=%d/%d不符",
-                    interiorMismatch, interiorTotal, bufferMismatch, bufferTotal));
-            for (String ex : interiorExamples) {
-                sender.sendMessage("[WEPoC]   " + ex);
-            }
-            for (String ex : bufferExamples) {
-                sender.sendMessage("[WEPoC]   " + ex);
-            }
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
-        return true;
-    }
-
-    // 完整方塊狀態（含所有屬性，例如樓梯朝向/半層/形狀、告示牌等）逐格比對兩個等大區域，
-    // 用來驗證 //copy //paste 這類「先讀後寫」的操作是否正確保留了方塊屬性，
-    // 不是只驗證方塊種類（那是 /wepoc verify 的範圍）。
-    // /wepoc blockdiff x1 y1 z1 x2 y2 z2 ox oy oz
-    private boolean handleBlockDiff(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player) || args.length < 10) {
-            sender.sendMessage("用法: /wepoc blockdiff x1 y1 z1 x2 y2 z2 ox oy oz");
-            return true;
-        }
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            int ox = Integer.parseInt(args[7]), oy = Integer.parseInt(args[8]), oz = Integer.parseInt(args[9]);
-
-            ServerLevel level = ((CraftWorld) ((Player) sender).getWorld()).getHandle();
-            int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
-            int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
-            int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
-
-            int total = 0, mismatch = 0;
-            List<String> examples = new ArrayList<>();
-            for (int x = minX; x <= maxX; x++) {
-                for (int y = minY; y <= maxY; y++) {
-                    for (int z = minZ; z <= maxZ; z++) {
-                        BlockPos posA = new BlockPos(x, y, z);
-                        BlockPos posB = new BlockPos(x + ox, y + oy, z + oz);
-                        String a = level.getBlockState(posA).toString();
-                        String b = level.getBlockState(posB).toString();
-                        total++;
-                        if (!a.equals(b)) {
-                            mismatch++;
-                            if (examples.size() < 8) {
-                                examples.add(String.format("pos=(%d,%d,%d) A=%s B=%s", x, y, z, a, b));
-                            }
-                        }
-                    }
-                }
-            }
-            sender.sendMessage(String.format("[WEPoC] blockdiff %d/%d不符（含完整屬性比對）", mismatch, total));
-            for (String ex : examples) {
-                sender.sendMessage("[WEPoC]   " + ex);
-            }
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
-        return true;
-    }
-
-    // 診斷用：直接印出 WorldEdit 自己的 BlockType 註冊表對某個方塊認得哪些屬性。
-    // /wepoc propdump minecraft:oak_stairs
-    private boolean handlePropDump(CommandSender sender, String[] args) {
-        if (args.length < 2) {
-            sender.sendMessage("用法: /wepoc propdump <block id>");
-            return true;
-        }
-        com.sk89q.worldedit.world.block.BlockType type = com.sk89q.worldedit.world.block.BlockTypes.get(args[1]);
-        if (type == null) {
-            sender.sendMessage("找不到方塊: " + args[1]);
-            return true;
-        }
-        sender.sendMessage("[WEPoC] " + args[1] + " getPropertyMap keys=" + type.getPropertyMap().keySet());
-        sender.sendMessage("[WEPoC] defaultState=" + type.getDefaultState());
-        return true;
-    }
-
-    /**
-     * 驗證 SYSTEM_ACTOR_UUID 那段修法：故意建立一個**完全不帶 actor** 的 EditSession
-     * （跟 BetterStructures 的 {@code ModulePasting.java} 呼叫 {@code newEditSession(World)}
-     * 是同一種呼叫方式），寫入一小塊區域，再檢查系統假 UUID 的 undo 深度有沒有增加——
-     * 增加就代表這次編輯真的被我們的 {@link WEAsyncExtent}/{@link UndoManager} 接管，
-     * 沒有走 WorldEdit 原生同步路徑（原生路徑完全不會碰 undoManager，深度永遠不動）。
-     * /wepoc noactortest x1 y1 z1 x2 y2 z2
-     */
-    private boolean handleNoActorTest(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player) || args.length < 7) {
-            sender.sendMessage("用法: /wepoc noactortest x1 y1 z1 x2 y2 z2"
-                    + "（模擬第三方外掛不帶 actor 呼叫 WorldEdit，驗證這類編輯會不會被引擎接管）");
-            return true;
-        }
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            int depthBefore = undoManager.getUndoDepth(SYSTEM_ACTOR_UUID);
-            com.sk89q.worldedit.world.World adaptedWorld = BukkitAdapter.adapt(player.getWorld());
-            try (EditSession editSession = WorldEdit.getInstance().newEditSessionBuilder()
-                    .world(adaptedWorld)
-                    .build()) {
-                editSession.setBlocks(new com.sk89q.worldedit.regions.CuboidRegion(
-                                com.sk89q.worldedit.math.BlockVector3.at(x1, y1, z1),
-                                com.sk89q.worldedit.math.BlockVector3.at(x2, y2, z2)),
-                        com.sk89q.worldedit.world.block.BlockTypes.STONE.getDefaultState());
-            }
-            // engine=off 時上面這段就是純原生同步路徑（跟沒裝這個引擎時 BetterStructures
-            // 貼結構的行為完全一樣），系統假 UUID 從頭到尾不會被 UndoManager 碰到。
-            // enqueueForward 是排到下一個 tick 才真正處理、寫入本身還要再經過分批限流跨數個
-            // tick 完成，這裡不能立刻檢查深度，延遲 40 tick（2 秒，5x5x5 這種小範圍測試量綽綽
-            // 有餘）再回報結果。
-            sender.sendMessage("[WEPoC] noactortest 已送出（before 深度=" + depthBefore + "），2 秒後回報結果...");
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                int depthAfter = undoManager.getUndoDepth(SYSTEM_ACTOR_UUID);
-                sender.sendMessage("[WEPoC] noactortest 結果：系統假 actor undo 深度 " + depthBefore
-                        + " -> " + depthAfter + (depthAfter > depthBefore
-                                ? "（被引擎接管，走分批限流管線）"
-                                : "（engine=off 或攔截失敗，走 WorldEdit 原生同步路徑）"));
-            }, 40L);
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        } catch (WorldEditException e) {
-            sender.sendMessage("[WEPoC] noactortest 失敗: " + e);
-        }
-        return true;
-    }
-
-    /**
-     * 光罩計算池（Rust）的獨立驗證指令，不碰 {@link UndoManager} 的正式 RELIGHT 路徑——
-     * 只是把指定範圍（+外擴緩衝圈）的既有方塊資料讀出來、丟給 Rust 算一次，跟世界裡
-     * 「已經是 vanilla 自己算出來的正確值」逐格比對，確認演算法本身站得住腳，再考慮接進
-     * 正式路徑。驗收標準（委託人拍板）：不要求逐格完全一致，容許小幅落差（±1 算符合），
-     * 只看整體有沒有大範圍離譜偏差。
-     * /wepoc rustlighttest x1 y1 z1 x2 y2 z2
-     */
-    private boolean handleRustLightTest(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player) || args.length < 7) {
-            sender.sendMessage("用法: /wepoc rustlighttest x1 y1 z1 x2 y2 z2"
-                    + "（拿範圍內既有的 vanilla 光值當 ground truth，驗證 Rust 光罩計算池算出來的值有多接近）");
-            return true;
-        }
-        if (!RustLightEngine.isAvailable(getLogger())) {
-            sender.sendMessage("[WEPoC] 光罩計算池 native 函式庫沒有成功載入，無法測試（見啟動 log）");
-            return true;
-        }
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            int buffer = 2;
-            int minX = Math.min(x1, x2) - buffer, maxX = Math.max(x1, x2) + buffer;
-            int minY = Math.min(y1, y2) - buffer, maxY = Math.max(y1, y2) + buffer;
-            int minZ = Math.min(z1, z2) - buffer, maxZ = Math.max(z1, z2) + buffer;
-            int width = maxX - minX + 1, height = maxY - minY + 1, length = maxZ - minZ + 1;
-            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-
-            byte[] opacity = new byte[width * height * length];
-            byte[] blockSeed = new byte[width * height * length];
-            byte[] skySeed = new byte[width * height * length];
-            byte[] groundTruthBlock = new byte[width * height * length];
-            byte[] groundTruthSky = new byte[width * height * length];
-            var blockListener = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
-            var skyListener = level.getLightEngine().getLayerListener(LightLayer.SKY);
-
-            for (int x = 0; x < width; x++) {
-                for (int y = 0; y < height; y++) {
-                    for (int z = 0; z < length; z++) {
-                        BlockPos pos = new BlockPos(minX + x, minY + y, minZ + z);
-                        int idx = ((x * height) + y) * length + z;
-                        BlockState state = level.getBlockState(pos);
-                        opacity[idx] = (byte) state.getLightBlock(level, pos);
-                        int actualBlockLight = blockListener.getLightValue(pos);
-                        int actualSkyLight = skyListener.getLightValue(pos);
-                        groundTruthBlock[idx] = (byte) actualBlockLight;
-                        groundTruthSky[idx] = (byte) actualSkyLight;
-
-                        boolean isBoundaryShell = x == 0 || y == 0 || z == 0
-                                || x == width - 1 || y == height - 1 || z == length - 1;
-                        int emission = state.getLightEmission();
-                        if (isBoundaryShell) {
-                            blockSeed[idx] = (byte) actualBlockLight;
-                            skySeed[idx] = (byte) actualSkyLight;
-                        } else if (emission > 0) {
-                            blockSeed[idx] = (byte) emission;
-                            skySeed[idx] = -1;
-                        } else {
-                            blockSeed[idx] = -1;
-                            skySeed[idx] = -1;
-                        }
-                    }
-                }
-            }
-
-            final int w = width, h = height, l = length;
-            new Thread(() -> {
-                var resultOpt = RustLightEngine.tryComputeLight(getLogger(), w, h, l, opacity, blockSeed, skySeed);
-                Bukkit.getScheduler().runTask(this, () -> {
-                    if (resultOpt.isEmpty()) {
-                        sender.sendMessage("[WEPoC] rustlighttest 失敗：光罩計算池呼叫失敗（見 log），fallback 情境本身也算驗證過了");
-                        return;
-                    }
-                    RustLightEngine.Result result = resultOpt.get();
-                    int total = 0, exactBlock = 0, closeBlock = 0, exactSky = 0, closeSky = 0;
-                    int worstBlockDiff = 0, worstSkyDiff = 0;
-                    for (int x = 1; x < w - 1; x++) {
-                        for (int y = 1; y < h - 1; y++) {
-                            for (int z = 1; z < l - 1; z++) {
-                                int idx = ((x * h) + y) * l + z;
-                                total++;
-                                int diffBlock = Math.abs(result.blockLight()[idx] - groundTruthBlock[idx]);
-                                int diffSky = Math.abs(result.skyLight()[idx] - groundTruthSky[idx]);
-                                worstBlockDiff = Math.max(worstBlockDiff, diffBlock);
-                                worstSkyDiff = Math.max(worstSkyDiff, diffSky);
-                                if (diffBlock == 0) {
-                                    exactBlock++;
-                                }
-                                if (diffBlock <= 1) {
-                                    closeBlock++;
-                                }
-                                if (diffSky == 0) {
-                                    exactSky++;
-                                }
-                                if (diffSky <= 1) {
-                                    closeSky++;
-                                }
-                            }
-                        }
-                    }
-                    sender.sendMessage(String.format(Locale.ROOT,
-                            "[WEPoC] rustlighttest 內部 %d 格（不含外圈緩衝）：方塊光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d"
-                                    + " | 天空光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d",
-                            total, exactBlock, 100.0 * exactBlock / total, closeBlock, 100.0 * closeBlock / total, worstBlockDiff,
-                            exactSky, 100.0 * exactSky / total, closeSky, 100.0 * closeSky / total, worstSkyDiff));
-                });
-            }, "wepoc-rustlighttest").start();
-            sender.sendMessage("[WEPoC] rustlighttest 已送出到背景執行緒計算，範圍 " + width + "x" + height + "x" + length + "，稍後回報結果...");
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
-        return true;
-    }
-
-    /**
-     * 驗證「直接把光值寫回世界」這條路徑本身能不能用——跟 {@link #handleRustLightTest}
-     * 驗證的是完全不同的事（那個只驗證演算法算出來的值準不準，這個不碰演算法，只驗證
-     * {@code DataLayer}/{@code LevelLightEngine#queueSectionData} 這條寫入機制本身有沒有
-     * 真的生效、query 得到）。故意先把值改壞、讀回確認真的變壞（證明寫入不是空氣），
-     * 再用原本備份的 {@code DataLayer} 整份還原、讀回確認真的還原——全程不留任何實際
-     * 破壞。/wepoc lightwritetest x y z
-     */
-    private boolean handleLightWriteTest(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player) || args.length < 4) {
-            sender.sendMessage("用法: /wepoc lightwritetest x y z（測試 DataLayer/queueSectionData 直接寫光值這條路徑本身能不能用，全程會還原、不留破壞）");
-            return true;
-        }
-        try {
-            int x = Integer.parseInt(args[1]), y = Integer.parseInt(args[2]), z = Integer.parseInt(args[3]);
-            BlockPos pos = new BlockPos(x, y, z);
-            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-            var lightEngine = level.getLightEngine();
-            var blockListener = lightEngine.getLayerListener(LightLayer.BLOCK);
-            net.minecraft.core.SectionPos sectionPos = net.minecraft.core.SectionPos.of(pos);
-
-            int originalValue = blockListener.getLightValue(pos);
-            net.minecraft.world.level.chunk.DataLayer existing = blockListener.getDataLayerData(sectionPos);
-            net.minecraft.world.level.chunk.DataLayer backup = existing != null ? existing.copy()
-                    : new net.minecraft.world.level.chunk.DataLayer();
-            // 2026-09-15 讀 Paper Starlight 原始碼 + Yarn 反編譯的 vanilla 原始碼後查到：
-            // queueSectionData 的 pending->visible swap 有一個閘門——只有這個 section
-            // 已經被引擎認證為「有資料」的狀態，排隊寫入才會真的被套用，否則永遠卡在
-            // pending 裡不生效也不報錯。vanilla 用一個 debug 用的公開方法把這個狀態
-            // 曝露出來，先印出來確認我們測試的這個 section 到底是不是這個狀態。
-            Object sectionTypeBefore = lightEngine.getDebugSectionType(LightLayer.BLOCK, sectionPos);
-
-            int localX = net.minecraft.core.SectionPos.sectionRelative(x);
-            int localY = net.minecraft.core.SectionPos.sectionRelative(y);
-            int localZ = net.minecraft.core.SectionPos.sectionRelative(z);
-            int corruptedValue = (originalValue + 5) % 16;
-
-            net.minecraft.world.level.chunk.DataLayer corrupted = backup.copy();
-            corrupted.set(localX, localY, localZ, corruptedValue);
-            // 2026-09-15 發現：這台 Paper 伺服器的 getLightEngine() 回傳的是 Paper 自己的
-            // ThreadedLevelLightEngine——光照運算本來就已經跑在專屬背景執行緒，runLightUpdates()
-            // 是它自己排程用的內部方法，外部手動呼叫會直接丟 UnsupportedOperationException
-            // （"Ran automatically on a different thread!"）。改成單純 queueSectionData 排隊，
-            // 交給它自己的排程機制非同步處理，延遲幾個 tick 後才讀回檢查有沒有生效。
-            lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, corrupted);
-            sender.sendMessage(String.format(Locale.ROOT,
-                    "[WEPoC] lightwritetest: 原值=%d，已排隊改成=%d，section狀態(排隊前)=%s，1 秒後讀回確認+還原...",
-                    originalValue, corruptedValue, sectionTypeBefore));
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                int afterCorrupt = blockListener.getLightValue(pos);
-                boolean writeWorked = afterCorrupt == corruptedValue;
-                Object sectionTypeAfter = lightEngine.getDebugSectionType(LightLayer.BLOCK, sectionPos);
-                sender.sendMessage(String.format(Locale.ROOT,
-                        "[WEPoC] lightwritetest: 讀回=%d（寫入%s生效），section狀態(排隊後)=%s，現在排隊還原...",
-                        afterCorrupt, writeWorked ? "有" : "沒有", sectionTypeAfter));
-                lightEngine.queueSectionData(LightLayer.BLOCK, sectionPos, backup);
-                Bukkit.getScheduler().runTaskLater(this, () -> {
-                    int afterRestore = blockListener.getLightValue(pos);
-                    boolean restoreWorked = afterRestore == originalValue;
-                    sender.sendMessage(String.format(Locale.ROOT,
-                            "[WEPoC] lightwritetest: 還原後讀回=%d（還原%s成功）",
-                            afterRestore, restoreWorked ? "" : "沒有"));
-                    if (!writeWorked) {
-                        sender.sendMessage("[WEPoC] !!! queueSectionData 這條路徑目前看起來沒有真的生效，不能拿來取代 checkBlock !!!");
-                    } else if (!restoreWorked) {
-                        sender.sendMessage("[WEPoC] !!! 還原失敗，這個位置的光值可能被改壞了，建議手動 /wepoc write 或重載該 chunk !!!");
-                    }
-                }, 20L);
-            }, 20L);
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
-        return true;
-    }
-
-    /**
-     * 驗證 {@link UndoManager} 正式 RELIGHT_APPLY（Rust 光罩計算池寫回）這條路徑本身算出來
-     * 的結果，跟 vanilla 拿同一批最終方塊狀態重新逐格 checkBlock 算出來的結果是否一致——
-     * 跟 {@code rustlighttest} 不一樣：那個是離線單獨呼叫 Rust，完全不碰 UndoManager；
-     * 這個是先讀一次「引擎剛剛寫回的值」，再強制 vanilla 用 checkBlock 重算同一個範圍
-     * （vanilla 用真實方塊狀態重算，結果應該收斂到跟引擎寫回的一樣），兩者一致才代表整條
-     * 正式路徑（含 hasSection 閘門判斷、DataLayer 組裝、queueSectionData 排隊）是對的。
-     * /wepoc relightverify x1 y1 z1 x2 y2 z2
-     */
-    private boolean handleRelightVerify(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player player) || args.length < 7) {
-            sender.sendMessage("用法: /wepoc relightverify x1 y1 z1 x2 y2 z2"
-                    + "（讀一次目前光值，強制 vanilla checkBlock 重算同一範圍，比對兩者是否一致）");
-            return true;
-        }
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-            int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
-            int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
-            int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
-            var blockListener = level.getLightEngine().getLayerListener(LightLayer.BLOCK);
-            var skyListener = level.getLightEngine().getLayerListener(LightLayer.SKY);
-
-            List<BlockPos> positions = new ArrayList<>();
-            int[] beforeBlock;
-            int[] beforeSky;
-            {
-                List<Integer> bb = new ArrayList<>();
-                List<Integer> bs = new ArrayList<>();
-                for (int x = minX; x <= maxX; x++) {
-                    for (int y = minY; y <= maxY; y++) {
-                        for (int z = minZ; z <= maxZ; z++) {
-                            BlockPos pos = new BlockPos(x, y, z);
-                            positions.add(pos);
-                            bb.add(blockListener.getLightValue(pos));
-                            bs.add(skyListener.getLightValue(pos));
-                        }
-                    }
-                }
-                beforeBlock = bb.stream().mapToInt(Integer::intValue).toArray();
-                beforeSky = bs.stream().mapToInt(Integer::intValue).toArray();
-            }
-
-            for (BlockPos pos : positions) {
-                level.getLightEngine().checkBlock(pos);
-            }
-            sender.sendMessage("[WEPoC] relightverify 已強制 vanilla 重算 " + positions.size() + " 格，1 秒後比對...");
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                int total = positions.size(), exactBlock = 0, closeBlock = 0, exactSky = 0, closeSky = 0;
-                int worstBlockDiff = 0, worstSkyDiff = 0;
-                List<String> examples = new ArrayList<>();
-                for (int i = 0; i < total; i++) {
-                    BlockPos pos = positions.get(i);
-                    int afterBlock = blockListener.getLightValue(pos);
-                    int afterSky = skyListener.getLightValue(pos);
-                    int diffBlock = Math.abs(afterBlock - beforeBlock[i]);
-                    int diffSky = Math.abs(afterSky - beforeSky[i]);
-                    worstBlockDiff = Math.max(worstBlockDiff, diffBlock);
-                    worstSkyDiff = Math.max(worstSkyDiff, diffSky);
-                    if (diffBlock == 0) exactBlock++;
-                    if (diffBlock <= 1) closeBlock++;
-                    if (diffSky == 0) exactSky++;
-                    if (diffSky <= 1) closeSky++;
-                    if (diffBlock > 1 && examples.size() < 5) {
-                        examples.add(String.format(Locale.ROOT, "pos=%s 引擎寫回=%d vanilla重算=%d",
-                                pos, beforeBlock[i], afterBlock));
-                    }
-                }
-                sender.sendMessage(String.format(Locale.ROOT,
-                        "[WEPoC] relightverify %d 格：方塊光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d"
-                                + " | 天空光 完全相符=%d(%.1f%%) ±1內=%d(%.1f%%) 最大落差=%d",
-                        total, exactBlock, 100.0 * exactBlock / total, closeBlock, 100.0 * closeBlock / total, worstBlockDiff,
-                        exactSky, 100.0 * exactSky / total, closeSky, 100.0 * closeSky / total, worstSkyDiff));
-                for (String ex : examples) {
-                    sender.sendMessage("[WEPoC]   " + ex);
-                }
-            }, 20L);
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
         return true;
     }
 
     // 見 pendingDangerConfirmByActor 欄位註解。/wepoc danger confirm
     private boolean handleDangerConfirm(CommandSender sender, String[] args) {
         if (!(sender instanceof Player player)) {
-            sender.sendMessage("需在遊戲內執行");
+            sendActionBar(sender, "需在遊戲內執行");
             return true;
         }
         if (args.length < 2 || !args[1].equalsIgnoreCase("confirm")) {
-            sender.sendMessage("用法: /wepoc danger confirm（用來放行上一個因為預估影響格數"
+            sendActionBar(sender, "用法: /wepoc danger confirm（用來放行上一個因為預估影響格數"
                     + "超過 " + String.format(Locale.ROOT, "%,d", DANGER_BLOCK_THRESHOLD) + " 格被擋下的操作，"
                     + "只對「緊接著送出的下一個指令」有效，用一次就丟）");
             return true;
         }
         pendingDangerConfirmByActor.put(player.getUniqueId(), System.currentTimeMillis());
-        sender.sendMessage(String.format(Locale.ROOT,
+        sendActionBar(sender, String.format(Locale.ROOT,
                 "[WEPoC] 危險操作已確認，%d 秒內送出的下一個 WorldEdit 指令會被放行一次"
                         + "（不管那個指令實際大小），送出其他任何指令都會讓這次確認失效。",
                 DANGER_CONFIRM_TTL_MILLIS / 1000));
-        return true;
-    }
-
-    // 權威性讀取真實世界方塊資料做比對，不只看聊天室回饋訊息。
-    // /wepoc verify x1 y1 z1 x2 y2 z2 <stone|air>
-    private boolean handleVerify(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player) || args.length < 8) {
-            sender.sendMessage("用法: /wepoc verify x1 y1 z1 x2 y2 z2 <stone|air>");
-            return true;
-        }
-        Player player = (Player) sender;
-        try {
-            int x1 = Integer.parseInt(args[1]), y1 = Integer.parseInt(args[2]), z1 = Integer.parseInt(args[3]);
-            int x2 = Integer.parseInt(args[4]), y2 = Integer.parseInt(args[5]), z2 = Integer.parseInt(args[6]);
-            String expected = args[7].toLowerCase(Locale.ROOT);
-            BlockState expectedState = expected.equals("air") ? Blocks.AIR.defaultBlockState() : Blocks.STONE.defaultBlockState();
-            ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-            int minX = Math.min(x1, x2), maxX = Math.max(x1, x2);
-            int minY = Math.min(y1, y2), maxY = Math.max(y1, y2);
-            int minZ = Math.min(z1, z2), maxZ = Math.max(z1, z2);
-            int total = 0, matched = 0;
-            for (int x = minX; x <= maxX; x++) {
-                for (int y = minY; y <= maxY; y++) {
-                    for (int z = minZ; z <= maxZ; z++) {
-                        BlockPos pos = new BlockPos(x, y, z);
-                        total++;
-                        if (level.getBlockState(pos).is(expectedState.getBlock())) {
-                            matched++;
-                        }
-                    }
-                }
-            }
-            sender.sendMessage("[WEPoC] verify " + expected + ": " + matched + "/" + total
-                    + (matched == total ? " 全部相符" : " 有不相符！"));
-        } catch (NumberFormatException e) {
-            sender.sendMessage("座標必須是整數");
-        }
-        return true;
-    }
-
-    private boolean handleMaxUndo(CommandSender sender, String[] args) {
-        if (args.length < 2) {
-            sender.sendMessage("用法: /wepoc maxundo <n>，目前=" + undoManager.getMaxStackPerPlayer()
-                    + "（PoC 階段的執行期設定，正式版應改接 config.yml）");
-            return true;
-        }
-        try {
-            undoManager.setMaxStackPerPlayer(Integer.parseInt(args[1]));
-            sender.sendMessage("[WEPoC] 每位玩家最大 undo/redo 深度設為 " + undoManager.getMaxStackPerPlayer());
-        } catch (NumberFormatException e) {
-            sender.sendMessage("請輸入整數");
-        }
-        return true;
-    }
-
-    private boolean handleEngine(CommandSender sender, String[] args) {
-        if (args.length < 2) {
-            sender.sendMessage("用法: /wepoc engine <on|off>，目前=" + (engineEnabled ? "on" : "off"));
-            return true;
-        }
-        engineEnabled = args[1].equalsIgnoreCase("on");
-        sender.sendMessage("[WEPoC] engine 設為 " + (engineEnabled ? "on" : "off"));
-        getLogger().info("[WEPoC] engine 設為 " + (engineEnabled ? "on" : "off"));
-        return true;
-    }
-
-    private boolean handleStats(CommandSender sender) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("需在遊戲內執行");
-            return true;
-        }
-        UUID actor = ((Player) sender).getUniqueId();
-        WEAsyncExtent extent = lastExtentByActor.get(actor);
-        String extentPart = extent == null
-                ? "尚無此玩家的 extent 紀錄"
-                : ("最近一次 extent 記錄=" + extent.getRecordedCount() + " fallback=" + extent.getFallbackCount());
-        // 檔位現在是每個指令自己帶的（規格書第 4 節：最後一個參數），沒有單一「目前檔位」
-        // 這種全域概念可以顯示——auto 的動態預算倒是全域共用同一個控制迴圈，仍值得show 出來。
-        String autoPart = String.format("auto 目前動態預算=%.2fms", undoManager.getAutoBudgetNanos() / 1_000_000.0);
-        sender.sendMessage("[WEPoC] " + extentPart
-                + " | " + autoPart
-                + " | undo 深度=" + undoManager.getUndoDepth(actor)
-                + " redo 深度=" + undoManager.getRedoDepth(actor));
-        return true;
-    }
-
-    private boolean handleMspt(CommandSender sender) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("需在遊戲內執行");
-            return true;
-        }
-        Player player = (Player) sender;
-        ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-        MinecraftServer server = level.getServer();
-        try {
-            long avgNanos = server.getAverageTickTimeNanos();
-            long[] recent = server.getTickTimesNanos();
-            long lastNanos = recent.length > 0 ? recent[(server.getTickCount() - 1 + recent.length) % recent.length] : -1;
-            sender.sendMessage(String.format(
-                    "[WEPoC] MSPT 平均=%.3fms 最近一筆=%.3fms tickCount=%d",
-                    avgNanos / 1_000_000.0, lastNanos / 1_000_000.0, server.getTickCount()));
-            getLogger().info("[WEPoC] MSPT 平均=" + (avgNanos / 1_000_000.0) + "ms");
-        } catch (Throwable t) {
-            sender.sendMessage("[WEPoC] 讀取 MSPT 介面失敗: " + t);
-            getLogger().severe("[WEPoC] MSPT 讀取失敗: " + t);
-            t.printStackTrace();
-        }
-        return true;
-    }
-
-    private boolean handleWrite(CommandSender sender, String[] args) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("需在遊戲內執行");
-            return true;
-        }
-        Player player = (Player) sender;
-        int count = 100;
-        if (args.length >= 2) {
-            try {
-                count = Integer.parseInt(args[1]);
-            } catch (NumberFormatException ignored) {
-            }
-        }
-
-        ServerLevel level = ((CraftWorld) player.getWorld()).getHandle();
-        Location loc = player.getLocation();
-        int baseX = loc.getBlockX();
-        int baseY = loc.getBlockY();
-        int baseZ = loc.getBlockZ();
-
-        List<BlockPos> touched = new ArrayList<>(count);
-        BlockState stone = Blocks.STONE.defaultBlockState();
-        BlockState air = Blocks.AIR.defaultBlockState();
-
-        long t0 = System.nanoTime();
-        boolean crashed = false;
-        Throwable crashCause = null;
-        try {
-            for (int i = 0; i < count; i++) {
-                BlockPos pos = new BlockPos(baseX + i, baseY, baseZ);
-                LevelChunk chunk = level.getChunk(pos.getX() >> 4, pos.getZ() >> 4);
-                int sectionIndex = chunk.getSectionIndex(pos.getY());
-                if (sectionIndex < 0 || sectionIndex >= chunk.getSections().length) {
-                    continue;
-                }
-                LevelChunkSection section = chunk.getSection(sectionIndex);
-                BlockState target = (i % 2 == 0) ? stone : air;
-                // 直接寫 section palette，跳過 Level.setBlock 整條管線（無鄰居通知/無紅石/無自動觸發光照）
-                section.setBlockState(pos.getX() & 15, pos.getY() & 15, pos.getZ() & 15, target, false);
-                touched.add(pos);
-            }
-        } catch (Throwable t) {
-            crashed = true;
-            crashCause = t;
-        }
-        long t1 = System.nanoTime();
-
-        long relightNanos = -1;
-        long broadcastNanos = -1;
-        if (!crashed) {
-            long r0 = System.nanoTime();
-            try {
-                for (BlockPos pos : touched) {
-                    level.getLightEngine().checkBlock(pos);
-                }
-            } catch (Throwable t) {
-                crashed = true;
-                crashCause = t;
-            }
-            relightNanos = System.nanoTime() - r0;
-
-            if (!crashed) {
-                long b0 = System.nanoTime();
-                try {
-                    for (BlockPos pos : touched) {
-                        BlockState now = level.getBlockState(pos);
-                        level.sendBlockUpdated(pos, now, now, 3);
-                    }
-                } catch (Throwable t) {
-                    crashed = true;
-                    crashCause = t;
-                }
-                broadcastNanos = System.nanoTime() - b0;
-            }
-        }
-
-        if (crashed) {
-            sender.sendMessage("[WEPoC] 直寫測試在第 " + touched.size() + " 格後拋出例外: " + crashCause);
-            getLogger().severe("[WEPoC] 直寫測試失敗");
-            crashCause.printStackTrace();
-        } else {
-            sender.sendMessage(String.format(
-                    "[WEPoC] 直寫 %d 格完成，寫入=%.2fms relight=%.2fms 廣播=%.2fms（無崩潰）",
-                    touched.size(), (t1 - t0) / 1_000_000.0, relightNanos / 1_000_000.0, broadcastNanos / 1_000_000.0));
-            getLogger().info("[WEPoC] 直寫測試通過, count=" + touched.size());
-        }
         return true;
     }
 }
